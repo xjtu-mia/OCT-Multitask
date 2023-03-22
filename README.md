@@ -10,7 +10,11 @@
 python terminal.py --preprocessing --dataset duke
 ```
 - If you want to do this process on other dataset, you can set the parameter value of dataset to "yifuyuan" or "retouch". Specially, If you want to do this on Retouch dataset, you have to set a specific device type of --oct_device, including "Cirrus", "Spectralis" and "Topcon".
-#### (2) Split dataset to train and test datasets 
+#### (2) Split dataset into train and test datasets 
+- The yifuyuan and duke dataset are automatically splited into training set and test set by the following command:
+```bash
+python terminal.py --split_dataset --dataset duke/yifuyuan
+```
 ## 3. Train and test the proposed model on differient datasets
 #### (1) Yifuyuan dataset
 #### (2) Duke dataset
