@@ -21,7 +21,7 @@ python terminal.py --split_dataset --dataset yifuyuan
 ```bash
 python terminal.py --split_dataset --dataset duke
 ```
-## 3. Train and test the proposed model on Yifuyuan and Duke dataset
+## 3. Train and test the proposed model on our clinical and Duke dataset
 - If you have done the above two steps for specific dataset, you can type the training and testing commands on the corresponding dataset given below:
 #### (1) Our clinical dataset
 ```bash
