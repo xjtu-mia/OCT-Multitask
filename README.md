@@ -3,7 +3,7 @@
 ## 1. Environment
 - Please prepare an environment with python=3.7, and then use the command "pip install -r requirements.txt" for the dependencies.
 ## 2. Prepare OCT datasets 
-You can download the datasets from the [Baidu Netdisk](https://pan.baidu.com/s/1sQboL5_6vvk9hAuANQpbiA?pwd=n4i4) (access code: n4i4) and decompress it to ["./datasets"](datasets/). Please go to ["./datasets/README.md"](datasets/README.md) for details. 
+- You can download the datasets from the [Baidu Netdisk](https://pan.baidu.com/s/1sQboL5_6vvk9hAuANQpbiA?pwd=n4i4) (access code: n4i4) and decompress it to ["./datasets"](datasets/). Please go to ["./datasets/README.md"](datasets/README.md) for details. 
 #### (1) Run pre-processing step for OCT B-scans
 - The pre-processing step contains OCT flattening and intensity normalization.
 - An example of pre-processing on Duke dataset:
