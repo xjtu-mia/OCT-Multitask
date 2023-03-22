@@ -32,4 +32,23 @@ python terminal.py --training --testing --dataset yifuyuan --backbone resnetv2
 python terminal.py --training --testing --dataset duke --backbone resnetv2
 ```
 ## 4. Semi-supervised learning on Retouch dataset
-- To do this, You must first get a pre-training weight file by training on a fully annotated dataset, like our clinical dataset.
+- To do this, You must first get a pre-training weights .pth file by training on a fully annotated dataset as a source dataset, like our clinical dataset.
+- After getting pre-training weights, you can generate pseudo labels of layer and fluid on Retouch Cirrus/Spectralis/Topcon dataset by using the following command (in the case of Cirrus):
+```bash
+python terminal.py --testing --generate_pseudo --dataset retouch --oct_device Cirrus --backbone resnetv2 --pretrain_path ./datasets/yifuyuan/result/yifuyuan_resnetv2_seed_8830/weights_final.pth
+```
+- where pretrain_path is the folder path of pre-trained weights.
+- Then, if you need to perform 6-fold cross validation on Retouch Cirrus/Spectralis/Topcon dataset, you need to execute the following two lines of commands in sequence, to separate the dataset and train the model (in the case of Cirrus):
+```bash
+python terminal.py --split_cross_valid --dataset retouch --oct_device Cirrus --k 6
+```
+```bash
+python terminal.py --cross_valid --training --testing --dataset retouch --oct_device Cirrus --backbone resnetv2 --k 6 --epoch 25 --pretrain_path ./datasets/yifuyuan/result/yifuyuan_resnetv2_seed_8830/weights_final.pth
+```
+- Finally, if you want to verify the performance of semi-supervised model on the source dataset (our clinical dataset), you can execute the following two commands to merge the training sets of source and target dataset, then train the model on this merged training set and test it on the test set of the source data set:
+```bash
+python terminal.py --merge_dataset --dataset retouch --oct_device Cirrus --k 6
+```
+```bash
+python terminal.py --training --testing --dataset retouch --oct_device Cirrus --backbone resnetv2 --epoch 25 --pretrain_path ./datasets/yifuyuan/result/yifuyuan_resnetv2_seed_8830/weights_final.pth
+```
