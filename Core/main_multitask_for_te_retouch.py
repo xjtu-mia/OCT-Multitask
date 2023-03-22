@@ -1,0 +1,1121 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import argparse
+from torch.utils.data import DataLoader
+from torch import autograd, optim
+from torch.optim.lr_scheduler import StepLR, MultiStepLR
+from torchsummary import summary
+from loss import DiceLoss, tversky_CEv2_loss_fun, categorical_crossentropy_v2, pcloss, PJcurvature
+from dataset_multitask import train_transform_data, val_transform_data, saveResult, drawmask, drawmask_truth
+from evaluate import get_y_true, get_y_pred, AUPR, ROC_auto, compute_pr_f1, MAD, RMSE
+from scipy.signal import savgol_filter
+import cv2
+import os
+import xlwt
+import json
+from matplotlib import pyplot as plt
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import torchvision
+from torchstat import stat
+import random
+import numpy.linalg as LA
+import sys
+sys.path.append(sys.path[0]+'/multitask_models')
+# 是否使用cuda
+
+"""
+# 把多个步骤整合到一起, channel=（channel-mean）/std, 因为是分别对三个通道处理
+x_transforms = transforms.Compose([       #transforms.Compose()串联多个transform操作
+    transforms.ToTensor(),  # -> [0,1]
+    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # ->[-1,1]
+])
+
+# mask只需要转换为tensor
+y_transforms = transforms.ToTensor()
+# 参数解析器,用来解析从终端读取的命令
+"""
+parse = argparse.ArgumentParser()
+device = torch.device("cuda")
+
+
+# pytorch tensor to tensorflow tensor
+def torch2tensor(torch):
+    # print(torch.shape)
+    shape = torch.shape
+    if len(shape) == 4:
+        tensor = np.empty((shape[0], shape[2], shape[3], shape[1]))
+        for n in range(shape[0]):
+            for c in range(shape[1]):
+                tensor[n, :, :, c] = torch[n, c, :, :]
+    elif len(shape) == 3:
+        tensor = np.empty((shape[0], shape[2], shape[1]))
+        for n in range(shape[0]):
+            for c in range(shape[1]):
+                tensor[n, :, c] = torch[n, c, :]
+    else:
+        tensor = torch
+    # print(tensor.shape)
+    return tensor
+
+
+def softargmax2d_col(input, eta=1, dim=2, dynamic_beta=False, epoch=None, max_epoch=None):
+    if dynamic_beta:
+        if epoch < 1:
+            eta = 10 * eta
+        else:
+            eta = eta
+
+    b, c, h, w = input.shape
+    '''for i, e in enumerate(eta):
+        input[:, i, :, :] = input[:, i, :, :] * e'''
+    x = nn.functional.softmax(input * eta, dim=dim)
+    indices = torch.unsqueeze(torch.linspace(0, h - 1, h), dim=0).to(device)
+    y = torch.zeros((b, c, w)).to(device)
+    for i in range(b):
+        for j in range(c):
+            y[i, j, :, ] = torch.mm(indices, x[i, j, :, :])
+    return y
+
+
+def posission_constraint(input, KF=False, device='cuda'):
+    device = torch.device(device)
+    b, c, w = input.shape[0], input.shape[1], input.shape[2]
+    x = input
+    for i in range(c - 1):  # BM-->INL_OPL
+        # print(i)
+        # x[:,i+1,:] = x[:,i,:] + nn.functional.relu(x[:,i+1,:] - x[:,i,:])
+        x[:, i + 1, :] = x[:, i, :] + nn.functional.softplus(x[:, i + 1, :] - x[:, i, :])
+
+    '''for i in range(2, c - 1):  #ILM-->INL_OPL
+        #print(i)
+        #x[:,i+1,:] = x[:,i,:] + nn.functional.relu(x[:,i+1,:] - x[:,i,:])
+        x[:, i + 1, :] = x[:, i, :] + nn.functional.softplus(x[:, i + 1, :] - x[:, i, :])'''
+
+    return x
+
+
+class masks_from_regression1:
+    def __init__(self, input, eta=1, dim=2, device='cuda', add=False, KF=False, convexhull=True):
+        self.input = input
+        self.eta = eta
+        self.dim = dim
+        self.device = device
+        self.add = add
+        self.KF = KF
+        self.convexhull = convexhull
+
+    def posission_constraint(self, input, KF=True):
+        b, c, w = input.shape[0], input.shape[1], input.shape[2]
+        x = input
+        for i in range(c - 1):  # BM-->INL_OPL
+            # print(i)
+            # x[:,i+1,:] = x[:,i,:] + nn.functional.relu(x[:,i+1,:] - x[:,i,:])
+            x[:, i + 1, :] = x[:, i, :] + nn.functional.softplus(x[:, i + 1, :] - x[:, i, :])
+
+        '''for i in range(2, c - 1):  # ILM-->INL_OPL
+            #print(i)
+            # x[:,i+1,:] = x[:,i,:] + nn.functional.relu(x[:,i+1,:] - x[:,i,:])
+            x[:, i + 1, :] = x[:, i, :] + nn.functional.softplus(x[:, i + 1, :] - x[:, i, :])'''
+        return x
+
+    def ConvexHull(self, img):
+        img = img.astype(np.uint8)
+        if len(img.shape) > 2:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img
+        h, w = img.shape
+        # 图片轮廓
+        _, contours, hierarchy = cv2.findContours(gray, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+        cnt = contours[0]
+        # 寻找凸包并绘制凸包（轮廓）
+        hull = cv2.convexHull(cnt)
+        length = len(hull)
+        im = np.zeros_like(img)
+        for m in range(len(hull)):
+            cv2.line(im, tuple(hull[m][0]), tuple(hull[(m + 1) % length][0]), 255, 1, lineType=cv2.LINE_AA)
+        y_index = np.zeros(im.shape[1])
+        for m in range(im.shape[1]):
+            y_index[m] = np.argmax(im[1:-1, m])
+        return y_index
+
+    def run(self):
+        device = torch.device(self.device)
+
+        b, c, h, w = self.input.shape
+
+        x = nn.functional.softmax(self.eta * self.input, dim=self.dim).cpu()
+
+        indices = torch.unsqueeze(torch.linspace(0, h - 1, h), dim=0)
+        y = torch.zeros((b, c, w))
+        if self.add:
+            mask = torch.ones((b, c - 1, h, w)) * -1
+        else:
+            mask = torch.zeros((b, c - 1, h, w))
+        BM_img = np.zeros((b, h, w))
+        act = True
+        avg_th = 0
+
+        for i in range(b):
+            for k in range(c):
+                y[i, k, :] = torch.mm(indices, x[i, k, :, :])
+        y = self.posission_constraint(y, KF=self.KF)  # 保证层之间不会出现拓扑错误
+        for i in range(b):
+            for k in range(c - 1):
+                top_index = torch.round(y[i, k, :])
+                bottom_index = torch.round(y[i, k + 1, :])
+                if self.convexhull:
+                    for j in range(w):
+                        # print( BM_img[i, 0: int(bottom_index[j]), int(j)])
+                        BM_img[i, 0: int(bottom_index[j]), int(j)] = 255
+                    if k == 5:
+                        bottom_index[:] = torch.tensor(self.ConvexHull(BM_img[i, :, :]))
+
+                for j in range(w):
+                    pixel_top = int(top_index[j].item())
+                    pixel_bottom = int(bottom_index[j].item())
+                    avg_th = avg_th + (pixel_bottom - pixel_top)
+                    if k == c - 2:
+                        thresh = 4  # BM
+                    elif k == c - 4:
+                        thresh = 3  # SRF
+                    else:
+                        thresh = 1
+                    if pixel_bottom - pixel_top > thresh:
+                        mask[i, k, pixel_top:pixel_bottom, j] = torch.ones((1, pixel_bottom - pixel_top))
+                        # print(mask[i, 0, pixel_top:pixel_bottom, j])
+                    else:
+                        if k > 0:
+                            mask[i, k - 1, pixel_top:pixel_bottom, j] = torch.ones((1, pixel_bottom - pixel_top))
+        avg_th = avg_th / b / c / w
+
+        if avg_th > 10:
+            act = True
+        else:
+            act = True
+        print(avg_th, act)
+        return mask.to(device), act
+
+
+class UncertaintyLoss(nn.Module):
+    # s=log(sigmma**2)
+    def __init__(self, v_num):
+        super(UncertaintyLoss, self).__init__()
+        s = torch.ones(v_num) * 0.1
+        self.s = nn.Parameter(s)
+        self.v_num = v_num
+
+    def forward(self, *input):
+        loss = 0
+        for i in range(self.v_num):
+            if i < 2:
+                loss += (0.5 * torch.exp(-self.s[i]) * input[i] + 0.5 * self.s[i])
+            else:
+                loss += (torch.exp(-self.s[i]) * input[i] + 0.5 * self.s[i])
+        print(self.s)
+        return loss
+
+
+def index2img(input, target_size):
+    shape = input.shape
+    x = np.zeros((shape[0], shape[1], target_size[0], shape[2]))
+    for b in range(shape[0]):
+        for c in range(shape[1]):
+            index = input[b, c, :]
+            for w in range(shape[2]):
+                y_co = np.round(index[w])
+                x[b, c, int(y_co), w] = 1
+    return x
+
+
+def save_to_exel(x_list, y_list, write_path):
+    xls = xlwt.Workbook()
+    sht1 = xls.add_sheet("Sheet1")
+    sht1.write(0, 0, 'recall')
+    sht1.write(0, 1, 'precision')
+    for i, x in enumerate(x_list):
+        sht1.write(i + 1, 0, x)
+        sht1.write(i + 1, 1, y_list[i])
+    xls.save(write_path)
+
+
+def save_to_exel2(x_list, write_path):
+    xls = xlwt.Workbook()
+    sht1 = xls.add_sheet("Sheet1")
+    start_row = 0
+    for k, v in x_list.items():
+        sht1.write(start_row, 0, k)
+        n = len(v[1])
+        for i in range(n):
+            sht1.write(start_row + 1, i, v[1][i])
+        for i, x in enumerate(v[0]):
+            sht1.write(start_row + 2, i, x)
+        start_row += 3
+    xls.save(write_path)
+
+
+def evl(results,
+        dataset='yifuyuan',
+        method='PR',
+        threshold_num=33,
+        classes=5,
+        target_size=(420, 420),
+        task=None,
+        flag_multi_class=True,
+        groundtruth_path=None,
+        save_path=None,
+        regression=False):
+    if flag_multi_class:
+        classes = classes
+        if classes == 1:
+            print('classes must > 1')
+    else:
+        classes = 1
+    if classes == 8 and task is None:
+        classes_list = ['layer0', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5', 'layer6', 'layer7']
+    if classes == 7 and task is None:
+        classes_list = ['layer0', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5', 'layer6']
+    if classes == 2 and task is None:
+        classes_list = ['fluid']
+    y_true = get_y_true(groundtruth_path, dataset=dataset, ly_classes=classes, target_size=target_size,
+                        regression=regression,
+                        task=task)  # transforming every image into array and saving in a list
+    y_pred = get_y_pred(results, classes, target_size=target_size)
+    au_dict = {}
+
+    """
+    evaluation methods
+
+    """
+
+    # 多分类，softmax
+    sum_AUPR = 0
+    sum_AUC = 0
+    if method == 'f1':  # AUC, AUPR, F1-score, Dice-score
+        au_dict = compute_pr_f1(y_pred, y_true, class_num=classes, task=task)  # compute pr,recall,f1
+        print('f1:', au_dict)
+        if task == 'index2area':
+            filename = 'f1_final'
+        else:
+            filename = 'f1'
+        with open(os.path.join(save_path, filename + '.json'), 'a') as outfile:
+            for k, v in au_dict.items():
+                json.dump({k: v}, outfile, ensure_ascii=False, indent=4)
+                outfile.write('\n')
+        f = open(os.path.join(save_path, filename + '.txt'), 'w', encoding='utf-8')  # 以'w'方式打开文件
+        for k, v in au_dict.items():  # 遍历字典中的键值
+            s2 = str(v)  # 把字典的值转换成字符型
+            f.write(k + '\n')  # 键和值分行放，键在单数行，值在双数行
+            f.write(s2 + '\n')
+        f.close()  # 关闭文件
+    else:
+        raise ValueError("error metric name")
+    return au_dict
+
+
+def train_model(model,
+                criterion,
+                optimizer,
+                dataload,
+                ly_classes=8,
+                pixel_ly_classes=9,
+                fl_classes=2,
+                epoch=0,
+                max_epoch=100,
+                eta=1,
+                k_size=51,
+                regression=False,
+                softargmax=False,
+                multitask=False):
+    dt_size = len(dataload.dataset)
+    epoch_loss = 0
+    step = 0
+    mean_loss_list = np.zeros(9)
+
+    if multitask:
+        for x, y1, y2, y3, y4 in tqdm(dataload, ncols=80):
+            # for x, y in dataload:
+            step += 1
+
+            inputs = x.to(device)
+            labels_1 = y1.to(device)
+            labels_2 = y2.to(device)
+            labels_3 = y3.to(device)
+            labels_4 = y4.to(device)
+            label_diff = torch.tensor(savgol_filter(np.array(y1[:, -1, :]), 51, 2), dtype=torch.float).to(device)
+            # zero the parameter gradients
+            optimizer.zero_grad()
+            # forward
+            outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
+            # print(outputs)if classes == 1:
+            outputs_2 = outputs_1
+            outputs_2_0 = outputs_1_0
+            # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
+            h = labels_1.shape[2]
+            outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                         max_epoch=max_epoch)
+            outputs_1 = posission_constraint(outputs_1)
+
+            pcurv_loss_1 = PJcurvature(device=device, k_size=k_size)(outputs_1[:, -1, :], label_diff)
+            outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                           max_epoch=max_epoch)
+            outputs_1_0 = posission_constraint(outputs_1_0)
+            pcurv_loss_1_0 = PJcurvature(device=device, k_size=k_size)(outputs_1_0[:, -1, :], label_diff)
+            '''
+            不计算没有label点的loss，即output与label在该点始终具有相同值
+            '''
+            outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
+            outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
+            outputs_2 = nn.Softmax(dim=2)(outputs_2)
+            outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
+            outputs_3 = nn.Softmax(dim=1)(outputs_3)
+            outputs_4 = nn.Softmax(dim=1)(outputs_4)
+            loss_1 = criterion[0](outputs_1, labels_1)
+            loss_2 = criterion[1](outputs_2, labels_2)
+            loss_1_0 = criterion[0](outputs_1_0, labels_1)
+            loss_2_0 = criterion[1](outputs_2_0, labels_2)
+            loss_3 = criterion[2](outputs_3, labels_3)
+            loss_4 = criterion[3](outputs_4, labels_4)
+            # loss = u_loss(1 * loss_1, 1 * loss_1_0, 1 * loss_2, 1 * loss_2_0, 10 * loss_3, 10 * loss_4)
+            # print(pcurv_loss_1.requires_grad, pcurv_loss_1, pcurv_loss_1_0)
+            loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4 + pcurv_loss_1 + pcurv_loss_1_0
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 20)
+            optimizer.step()
+            epoch_loss += loss.item()
+            loss_list = np.array([loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(),
+                                  loss_3.item(), loss_4.item(), pcurv_loss_1.item(), pcurv_loss_1_0.item(),
+                                  loss.item()])
+            mean_loss_list = mean_loss_list + loss_list
+            print("%d/%d,train_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
+            '''feature_output1 = model.featuremap1.cpu()
+            print(feature_output1.shape)
+            out = torchvision.tools.make_grid(feature_output1[0])
+            feature_imshow(out[:1])'''
+    else:
+        for x, y in tqdm(dataload, ncols=80):
+            # for x, y in dataload:
+            step += 1
+
+            inputs = x.to(device)
+            labels = y.to(device)
+            # print(labels.shape)
+            # zero the parameter gradients
+            optimizer.zero_grad()
+            # forward
+            outputs = model(inputs)
+            # print(outputs)
+            if ly_classes == 1:
+                outputs = nn.Sigmoid()(outputs)
+                loss = criterion(outputs, labels)
+            else:
+                # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
+                if not regression:
+                    outputs = nn.Softmax(dim=1)(outputs)
+                else:
+                    if softargmax:
+                        h = labels.shape[2]
+                        outputs = softargmax2d_col(outputs, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                                   max_epoch=max_epoch)
+                        '''
+                        不计算没有label点的loss，即output与label在该点始终具有相同值
+                        '''
+                        outputs_ = torch.where(labels == 0, labels, outputs)
+                        # outputs = posission_constraint(outputs)
+                    else:
+                        outputs = nn.Softmax(dim=2)(outputs)
+                loss = criterion(outputs_, labels)
+
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            print("%d/%d,train_loss:%0.3f" % (step, (dt_size - 1) // dataload.batch_size + 1, loss.item()))
+    # scheduler.step()
+    print("第%d个epoch的lr, weight_decay：%f, %f" % (
+        epoch, optimizer.param_groups[0]['lr'], optimizer.param_groups[0]['weight_decay']))
+    mean_epoch_loss = epoch_loss / ((dt_size - 1) // dataload.batch_size + 1)
+    mean_loss_list = mean_loss_list / ((dt_size - 1) // dataload.batch_size + 1)
+    print("epoch %d mean_train_loss:" % (epoch), mean_loss_list)
+    return mean_loss_list, model
+
+
+def val_model(model,
+              criterion,
+              dataload,
+              dataset='duke',
+              ly_classes=8,
+              pixel_ly_classes=9,
+              fl_classes=2,
+              epoch=0,
+              max_epoch=100,
+              eta=1,
+              k_size=51,
+              regression=False,
+              softargmax=False,
+              multitask=False):
+    model.eval()
+    with torch.no_grad():  # 不进行梯度计算和反向传播
+        dt_size = len(dataload.dataset)
+        target_size = (dataload.dataset[0][0].shape[1], dataload.dataset[0][0].shape[2])
+        print(target_size)
+        epoch_loss = 0
+        step = 0
+        img_arr_ly = np.empty((len(dataload.dataset), target_size[0], target_size[1], ly_classes))
+        img_arr_fl = np.empty((len(dataload.dataset), target_size[0], target_size[1], fl_classes))
+        n = 0
+        mean_loss_list = np.zeros(9)
+        if dataset == 'duke':
+            name_list = ['ILM', 'RNFL-GCL', 'IPL-INL', 'INL-OPL', 'OPL-ONL', 'IS-OS', 'OS-RPE', 'BM', 'mean']
+        elif dataset == 'yifuyuan':
+            name_list = ['ILM', 'GCL_IPL', 'INL_OPL', 'ONL_NE', 'IRPE', 'ORPE', 'BM', 'mean']
+        tmp_mad = np.zeros((len(name_list) - 1))
+        tmp_rmse = np.zeros((len(name_list) - 1))
+        mean_absolute_distance = {}
+        root_mean_square_error = {}
+        for name in name_list:
+            mean_absolute_distance[name] = 0
+        if multitask:
+            for x, y1, y2, y3, y4 in tqdm(dataload, ncols=60):
+                # for x, y in dataload:
+                step += 1
+                inputs = x.to(device)
+                labels_1 = y1.to(device)
+                labels_2 = y2.to(device)
+                labels_3 = y3.to(device)
+                labels_4 = y4.to(device)
+                label_diff = torch.tensor(savgol_filter(np.array(y1[:, -1, :]), 51, 2), dtype=torch.float).to(device)
+                # print(labels.shape)
+                # zero the parameter gradients
+                # forward
+                outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
+                # print(outputs)if classes == 1:
+
+                # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
+                h = labels_3.shape[2]
+                outputs_2 = outputs_1
+                outputs_2_0 = outputs_1_0
+                outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                             max_epoch=max_epoch)
+                outputs_1 = posission_constraint(outputs_1)
+                pcurv_loss_1 = PJcurvature(device=device, k_size=k_size)(outputs_1[:, -1, :], label_diff)
+                outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                               max_epoch=max_epoch)
+                outputs_1_0 = posission_constraint(outputs_1_0)
+                pcurv_loss_1_0 = PJcurvature(device=device, k_size=k_size)(outputs_1_0[:, -1, :], label_diff)
+                '''
+                不计算没有label点的loss，即output与label在该点始终具有相同值
+                '''
+                outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
+                outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
+                outputs_2 = nn.Softmax(dim=2)(outputs_2)
+                outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
+                outputs_3 = nn.Softmax(dim=1)(outputs_3)
+                outputs_4 = nn.Softmax(dim=1)(outputs_4)
+                loss_1 = criterion[0](outputs_1, labels_1)
+                loss_1_0 = criterion[0](outputs_1_0, labels_1)
+                loss_2 = criterion[1](outputs_2, labels_2)
+                loss_2_0 = criterion[1](outputs_2_0, labels_2)
+                loss_3 = criterion[2](outputs_3, labels_3)
+                loss_4 = criterion[3](outputs_4, labels_4)
+                loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4 + pcurv_loss_1 + pcurv_loss_1_0
+                loss_list = np.array(
+                    [loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(), loss_3.item(), loss_4.item(),
+                     pcurv_loss_1.item(), pcurv_loss_1_0.item(), loss.item()])
+                mean_loss_list = mean_loss_list + loss_list
+                epoch_loss += loss.item()
+
+                print("%d/%d,val_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
+                img_y_ly = outputs_1.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_true_ly = labels_1.cpu().numpy()
+                tmp_mad = tmp_mad + MAD(img_y_ly, img_true_ly, softargmax=softargmax)
+                tmp_rmse = tmp_rmse + RMSE(img_y_ly, img_true_ly, softargmax=softargmax)
+
+                img_y_ly = torch2tensor(img_y_ly)
+                img_arr_ly[n] = img_y_ly[0]
+
+                img_y_fl = outputs_4.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_true_fl = labels_4.cpu().numpy()
+                img_y_fl = torch2tensor(img_y_fl)
+                img_arr_fl[n] = img_y_fl[0]
+                n += 1
+        else:
+            for x, y in tqdm(dataload, ncols=60):
+                step += 1
+                inputs = x.to(device)
+                labels = y.to(device)
+                # forward
+                outputs = model(inputs)
+                # print(outputs)
+                if ly_classes == 1:
+                    outputs = nn.Sigmoid()(outputs)
+                    loss = criterion(outputs, labels)
+                else:
+                    # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
+                    if not regression:
+                        outputs = nn.Softmax(dim=1)(outputs)
+                    else:
+                        if softargmax:
+                            h = labels.shape[2]
+                            outputs = softargmax2d_col(outputs, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                                       max_epoch=max_epoch)
+                            '''
+                            不计算没有label点的loss，即output与label在该点始终具有相同值
+                            '''
+                            outputs_ = torch.where(labels == 0, labels, outputs)
+                            # outputs = posission_constraint(outputs)
+                        else:
+                            outputs = nn.Softmax(dim=2)(outputs)
+                    loss = criterion(outputs_, labels)
+
+                epoch_loss += loss.item()
+                print("%d/%d,val_loss:%0.3f" % (step, (dt_size - 1) // dataload.batch_size + 1, loss.item()))
+                img_y = outputs.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_y = torch2tensor(img_y)
+                img_arr_ly[n] = img_y[0]
+                n += 1
+        mean_epoch_loss = epoch_loss / ((dt_size - 1) // dataload.batch_size + 1)
+        mean_loss_list = mean_loss_list / ((dt_size - 1) // dataload.batch_size + 1)
+        tmp_mad = tmp_mad / len(dataload.dataset)
+        tmp_rmse = tmp_rmse / len(dataload.dataset)
+        print(len(dataload.dataset))
+        for i, name in enumerate(name_list):
+            if name == 'mean':
+                mmad = 0
+                mrmse = 0
+                for value in mean_absolute_distance.values():
+                    mmad += value
+                mmad = mmad / (len(name_list) - 1)
+                mean_absolute_distance[name] = mmad
+                for value in root_mean_square_error.values():
+                    mrmse += value
+                mrmse = mrmse / (len(name_list) - 1)
+                root_mean_square_error[name] = mrmse
+            else:
+                mean_absolute_distance[name] = tmp_mad[i]
+                root_mean_square_error[name] = tmp_rmse[i]
+        print("epoch %d mean_val_loss:" % (epoch), mean_loss_list)
+
+    return mean_loss_list, img_arr_ly, img_arr_fl, mean_absolute_distance, root_mean_square_error
+
+
+def test(root=None,
+         dataset='retouch',
+         oct_device = 'Topcon',
+         backbone='resnetv2',
+         save_path=None,
+         image_fold=None,
+         layer_label_fold=None,
+         fluid_label_fold=None,
+         layer_fluid_label_fold=None,
+         layer_area_label_fold=None,
+         ckp=None,
+         ly_classes=8,
+         pixel_ly_classes=9,
+         fl_classes=2,
+         one_hot='n',
+         regression=False,
+         softargmax=False,
+         multitask=False,
+         fluid_label=False,
+         eta=1,
+         target_size=(512, 512),
+         image_color_mode='gray'):
+    print('testing...')
+    if image_color_mode == 'gray':
+        channel = 1
+    else:
+        channel = 3
+    device = torch.device("cuda")
+    if backbone == 'resnetv2':
+        from multitask_models.multitask_resnestv2 import \
+            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_resUnet_ly_masks
+        model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                  multitask=multitask).to(device)
+    elif backbone == 'vgg':
+        from multitask_models.multitask_VGG import \
+            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_vggUnet_ly_masks
+        model = tinyquadra_multi_vggUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                  multitask=multitask).to(device)
+    elif backbone == 'resnet':
+        from multitask_models.multitask_resnestv2 import R50_Unet as tinyquadra_multi_oresUnet_ly_masks
+        model = tinyquadra_multi_oresUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                   multitask=multitask).to(device)
+    elif backbone == 'convnext':
+        from multitask_models.multitask_convnext import \
+            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_convnextUnet_ly_masks
+        model = tinyquadra_multi_convnextUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                       multitask=multitask).to(device)
+    elif backbone == 'swintrans':
+        from multitask_models.multitask_swintrans import \
+            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_swinUnet_ly_masks
+        model = tinyquadra_multi_swinUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                   multitask=multitask).to(device)
+    elif backbone == 'shuffletrans':
+        from multitask_models.multitask_shuffletrans import \
+            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_shufflUnet_ly_masks
+        model = tinyquadra_multi_shufflUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                     multitask=multitask).to(device)
+    elif backbone == 'mpvit':
+        from multitask_models.multitask_mpvit import \
+            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_mpvitUnet_ly_masks
+        model = tinyquadra_multi_mpvitUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                    multitask=multitask).to(device)
+    print('loading model...', ckp)
+
+    model.load_state_dict(torch.load(ckp, map_location='cuda'))
+    '''pretext_model = torch.load(ckp, map_location='cuda')
+    model2_dict = model.state_dict()
+    state_dict = {k: v for k, v in pretext_model.items() if k in model2_dict.keys()}
+    model2_dict.update(state_dict)
+    model.load_state_dict(model2_dict)'''
+    model.eval()
+    # summary(model, (channel,) + target_size)
+    dataset_test = val_transform_data(root=os.path.join(root, 'preprocessing_data'),
+                                      dataset=dataset,
+                                      image_fold=image_fold,
+                                      layer_label_fold=layer_label_fold,
+                                      fluid_label_fold=fluid_label_fold,
+                                      layer_fluid_label_fold=layer_fluid_label_fold,
+                                      ly_classes=ly_classes,
+                                      pixel_ly_classes=pixel_ly_classes,
+                                      fl_classes=fl_classes,
+                                      one_hot=one_hot,
+                                      regression=regression,
+                                      softargmax=softargmax,
+                                      multitask=multitask,
+                                      fluid_label=fluid_label,
+                                      target_size=target_size)
+    dataload = DataLoader(dataset_test,
+                          batch_size=1,
+                          shuffle=False,
+                          num_workers=0
+                          )
+
+    # import matplotlib.pyplot as plt
+    # plt.ion()
+    i = 0
+    n = 0
+    if dataset == 'duke':
+        name_list = ['ILM', 'RNFL-GCL', 'IPL-INL', 'INL-OPL', 'OPL-ONL', 'IS-OS', 'OS-RPE', 'BM', 'mean']
+    if dataset == 'yifuyuan' or dataset== 'retouch':
+        name_list = ['ILM', 'IPL_INL', 'INL_OPL', 'ONL_NE', 'IRPE', 'ORPE', 'BM', 'mean']
+    img_arr_ly = np.empty((len(dataload.dataset), target_size[0], target_size[1], ly_classes))
+    img_arr_fl = np.empty((len(dataload.dataset), target_size[0], target_size[1], fl_classes))
+    img_arr_lyfl = np.empty((len(dataload.dataset), target_size[0], target_size[1], pixel_ly_classes))
+    img_arr_ly_area = np.empty((len(dataload.dataset), target_size[0], target_size[1], ly_classes))
+    mean_absolute_distance = {}
+    root_mean_square_error = {}
+    for name in name_list:
+        mean_absolute_distance[name] = 0
+    with torch.no_grad():  # 不进行梯度计算和反向传播
+        dt_size = len(dataload.dataset)
+        step = 0
+        mean_loss = 0
+        mean_loss_list = np.zeros(7)
+        tmp_mad = np.zeros((len(name_list) - 1))
+        tmp_rmse = np.zeros((len(name_list) - 1))
+        if multitask:
+            for x, y1, y2, y3, y4 in tqdm(dataload, ncols=60):
+                step += 1
+                inputs = x.to(device)
+                labels_1 = y1.to(device)
+                labels_2 = y2.to(device)
+                labels_3 = y3.to(device)
+                labels_4 = y4.to(device)
+                outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
+                '''feature_output1 = model.featuremap1.transpose(1, 0).cpu()
+
+                out = torchvision.tools.make_grid(feature_output1)
+                feature_imshow(out)'''
+
+                h = outputs_1.shape[2]
+                outputs_2 = outputs_1
+                outputs_2_0 = outputs_1_0
+                img_y_ly_area, _ = masks_from_regression1(outputs_1,
+                                                          eta=1, dim=2, device='cuda',
+                                                          add=False, convexhull=False).run()
+                outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta)
+                outputs_1 = posission_constraint(outputs_1)
+                outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta)
+                outputs_1_0 = posission_constraint(outputs_1_0)
+                outputs_2 = nn.Softmax(dim=2)(outputs_2)
+                outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
+                outputs_3 = nn.Softmax(dim=1)(outputs_3)
+                outputs_4 = nn.Softmax(dim=1)(outputs_4)
+                outputs_1_ = outputs_1
+                outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
+                outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
+                criterion_1 = nn.SmoothL1Loss(beta=1)
+                criterion_2 = categorical_crossentropy_v2(w=1)
+                if dataset == 'duke':
+                    alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    gamma = 0.4
+                elif dataset == 'yifuyuan' or dataset=='retouch':
+                    if pixel_ly_classes == ly_classes:
+                        alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                        beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                        w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                        gamma = 0.4
+                    else:
+                        alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                        beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                        w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2]
+                        gamma = 0.4
+                criterion_3 = tversky_CEv2_loss_fun(alpha=alpha,
+                                                    beta=beta,
+                                                    w=w,
+                                                    gamma=gamma)
+                criterion_4 = tversky_CEv2_loss_fun(alpha=[0.5, 0.5],
+                                                    beta=[0.5, 0.5],
+                                                    w=[0.5, 2],
+                                                    gamma=0.4)
+                criterion = (criterion_1, criterion_2, criterion_3, criterion_4)
+                loss_1 = criterion[0](outputs_1, labels_1).cpu().numpy()
+                loss_2 = criterion[1](outputs_2, labels_2).cpu().numpy()
+                loss_1_0 = criterion[0](outputs_1_0, labels_1).cpu().numpy()
+                loss_2_0 = criterion[1](outputs_2_0, labels_2).cpu().numpy()
+                loss_3 = criterion[2](outputs_3, labels_3).cpu().numpy()
+                loss_4 = criterion[3](outputs_4, labels_4).cpu().numpy()
+                loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4
+                loss_list = np.array(
+                    [loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(), loss_3.item(), loss_4.item(),
+                     loss.item()])
+                print("%d/%d,test_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
+                img_y_ly = outputs_1.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_y_ly_ = outputs_1_.cpu().numpy()
+                img_true = labels_1.cpu().numpy()
+                tmp_mad = tmp_mad + MAD(img_y_ly, img_true, softargmax=softargmax) * 3.91
+                tmp_rmse = tmp_rmse + RMSE(img_y_ly, img_true, softargmax=softargmax) * 3.91
+
+                img_y_ly = index2img(img_y_ly_, target_size=target_size)
+                img_y_ly = torch2tensor(img_y_ly)
+                img_arr_ly[n] = img_y_ly[0]
+                img_y_fl = outputs_4.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_y_fl = torch2tensor(img_y_fl)
+                img_arr_fl[n] = img_y_fl[0]
+                img_y_lyfl = outputs_3.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_y_lyfl = torch2tensor(img_y_lyfl)
+                img_arr_lyfl[n] = img_y_lyfl[0]
+                img_y_ly_area = img_y_ly_area.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+                img_y_ly_area = torch2tensor(img_y_ly_area)
+                img_arr_ly_area[n, :, :, 1:] = img_y_ly_area[0]
+                n += 1
+                mean_loss = mean_loss + loss
+                mean_loss_list = mean_loss_list + loss_list
+            mean_loss = mean_loss / len(dataload.dataset)
+            mean_loss_list = mean_loss_list / len(dataload.dataset)
+            print(mean_loss_list)
+            test_path = os.path.join(root, 'preprocessing_data', image_fold)
+            groundtruth_path = os.path.join(root, 'preprocessing_data', fluid_label_fold.split('/')[0])
+            tmp_mad = tmp_mad / len(dataload.dataset)
+            tmp_rmse = tmp_rmse / len(dataload.dataset)
+            print(len(dataload.dataset))
+            for i, name in enumerate(name_list):
+                if name == 'mean':
+                    mmad = 0
+                    mrmse = 0
+                    for value in mean_absolute_distance.values():
+                        mmad += value
+                    mmad = mmad / (len(name_list) - 1)
+                    mean_absolute_distance[name] = mmad
+                    for value in root_mean_square_error.values():
+                        mrmse += value
+                    mrmse = mrmse / (len(name_list) - 1)
+                    root_mean_square_error[name] = mrmse
+                else:
+                    mean_absolute_distance[name] = tmp_mad[i]
+                    root_mean_square_error[name] = tmp_rmse[i]
+            print(mean_absolute_distance)
+            results_item = {'MAD': [list(mean_absolute_distance.values()), list(mean_absolute_distance.keys())],
+                            'RMSE': [list(root_mean_square_error.values()), list(root_mean_square_error.keys())]}
+            '''save_to_exel2(list(mean_absolute_distance.values()), list(mean_absolute_distance.keys()),
+                          os.path.join(save_path, 'results.xlsx'), start_row=0, tag='MAD')
+            save_to_exel2(list(root_mean_square_error.values()), list(root_mean_square_error.keys()),
+                          os.path.join(save_path, 'results.xlsx'), start_row=2, tag='RMSE')'''
+            saveResult(save_path,
+                       test_path,
+                       target_size,
+                       dataset=dataset,
+                       npyfile_ly=img_arr_ly,
+                       npyfile_fl=img_arr_fl,
+                       npyfile_ly_fl=img_arr_lyfl,
+                       npyfile_ly_area=img_arr_ly_area,
+                       flag_multi_class=True,
+                       ly_classes=ly_classes,
+                       pixel_ly_classes=pixel_ly_classes,
+                       fl_classes=fl_classes,
+                       regression=regression)
+            drawmask(test_path,
+                     save_path,
+                     dataset=dataset,
+                     ly_classes=ly_classes,
+                     pixel_ly_classes=pixel_ly_classes,
+                     fl_classes=fl_classes,
+                     target_size=target_size,
+                     regression=regression,
+                     split_IRF=False,
+                     task='index2area')  # visualization-
+            drawmask_truth(test_path,
+                           groundtruth_path,
+                           save_path,
+                           dataset=dataset,
+                           ly_classes=ly_classes,
+                           pixel_ly_classes=pixel_ly_classes,
+                           fl_classes=fl_classes,
+                           target_size=target_size,
+                           regression=regression)
+            au_dict_fl = evl(img_arr_fl,
+                             method='f1',
+                             threshold_num=33,
+                             classes=fl_classes,
+                             target_size=target_size,
+                             flag_multi_class=True,
+                             dataset=dataset,
+                             groundtruth_path=os.path.join(root, 'preprocessing_data', fluid_label_fold),
+                             save_path=save_path)
+            # print(au_dict)
+            au_dict_lyfl = evl(img_arr_lyfl,
+                               method='f1',
+                               threshold_num=33,
+                               classes=pixel_ly_classes,
+                               target_size=target_size,
+                               flag_multi_class=True,
+                               dataset=dataset,
+                               groundtruth_path=os.path.join(root, 'preprocessing_data', layer_fluid_label_fold),
+                               save_path=save_path)
+            # print(au_dict_lyfl)
+            au_dict_lyfl['class_name'].append('IRF branch')
+            au_dict_lyfl['F1-score'] += au_dict_fl['F1-score']
+            au_dict_lyfl['class_name'].append('mean')
+            au_dict_lyfl['F1-score'].append(
+                sum(au_dict_lyfl['F1-score'][:-2] + au_dict_fl['F1-score']) / (pixel_ly_classes - 1))
+            results_item['F1-score'] = [au_dict_lyfl['F1-score'], au_dict_lyfl['class_name']]
+            '''save_to_exel2(au_dict_lyfl['F1-score'], au_dict_lyfl['class_name'], 
+                          os.path.join(save_path, 'results.xlsx'), start_row=6, tag='F1-score')'''
+            au_dict_ly = evl(img_arr_ly_area,
+                             method='f1',
+                             task='index2area',
+                             threshold_num=33,
+                             classes=ly_classes,
+                             target_size=target_size,
+                             flag_multi_class=True,
+                             dataset=dataset,
+                             groundtruth_path=os.path.join(root, 'preprocessing_data', layer_area_label_fold),
+                             save_path=save_path)
+            au_dict_ly['class_name'].append('mean')
+            au_dict_ly['F1-score'] += [au_dict_ly['mean_F1']]
+            au_dict_ly['class_name'].append('mean_irf')
+            au_dict_ly['F1-score'].append(
+                sum(au_dict_ly['F1-score'][:-1] + au_dict_fl['F1-score']) / (pixel_ly_classes - 1))
+            results_item['Reg F1-score'] = [au_dict_ly['F1-score'], au_dict_ly['class_name']]
+            save_to_exel2(results_item, os.path.join(save_path, 'results.xls'))
+        with open(os.path.join(save_path, 'test_results.json'), 'a') as outfile:
+            outfile.seek(0)
+            outfile.truncate()  # 清空文件
+            json.dump({'loss': mean_loss_list.tolist()}, outfile, ensure_ascii=False, indent=4)
+            outfile.write('\n')
+            if regression:
+                json.dump({'MAD': mean_absolute_distance}, outfile, ensure_ascii=False, indent=4)
+                outfile.write('\n')
+                json.dump({'RMSE': root_mean_square_error}, outfile, ensure_ascii=False, indent=4)
+                outfile.write('\n')
+
+        # drawmask_truth(test_path, groundtruth_path, save_path, classes=classes,target_size=target_size)
+
+        # plt.imshow(img_y)
+        # plt.pause(0.1)
+        # plt.show()
+
+
+'''
+parse = argparse.ArgumentParser()
+parse.add_argument("--action", type=str, help="train or test",default='test')
+parse.add_argument("--batch_size", type=int, default=2)
+parse.add_argument("--one_hot", type=str, default='n')
+parse.add_argument("--epoch", type=int, default=1)
+parse.add_argument("--target_size", type=tuple, default=(512,512))
+parse.add_argument("--ckp", type=str, help="the path of model weight file", default="C:/Users/whl/python_project/torch-DR_seg-master/weights_0.pth")
+parse.add_argument("--classes", type=int, default=1)
+args = parse.parse_args()
+if __name__ == '__main__':
+    root = "C:/Users/whl/python_project/torch-DR_seg-master/data/val"
+    if args.action == 'test':
+        test(args.batch_size,args.ckp,classes=args.classes,one_hot=args.one_hot,target_size=args.target_size)
+    else:
+        train(args.batch_size, classes=args.classes,one_hot=args.one_hot,max_epoch=args.epoch,target_size=args.target_size)
+'''
+
+
+def main(dataset='retouch',
+         oct_device = 'Topcon',
+         action='test',
+         pretraining=None,
+         tr_image_fold='image',
+         tr_layer_label_fold='label/layers',
+         tr_fluid_label_fold='label/fluid',
+         tr_layer_fluid_label_fold='label/covered',
+         tr_layer_area_label_fold='label/covered_wo_irf',
+         val_image_fold='image',
+         val_layer_label_fold='label/layers',
+         val_fluid_label_fold='label/fluid',
+         val_layer_fluid_label_fold='label/covered',
+         val_layer_area_label_fold='label/covered_wo_irf',
+         image_color_mode='gray',
+         regression=True,
+         softargmax=False,
+         multitask=False,
+         fluid_label=True,
+         eta=1,
+         backbone='resnetv2',
+         batch_size=2,
+         one_hot='y',
+         epoch=40,
+         target_size=(512, 512),
+         ly_classes=8,
+         pixel_ly_classes=9,
+         fl_classes=2,
+         learning_rate=0.0001,
+         ckp="C:/Users/whl/python_project/torch-DR_seg-master/weights_loss.pth",
+         root="C:/Users/whl/python_project/torch-DR_seg-master/data/val",
+         save_path=None,
+         log_path=None
+         ):
+    writer = SummaryWriter(log_path)
+    print(action)
+    if action == 'test':
+        test(root=root,
+             dataset=dataset,
+             oct_device=oct_device,
+             backbone=backbone,
+             save_path=save_path,
+             image_fold=val_image_fold,
+             layer_label_fold=val_layer_label_fold,
+             fluid_label_fold=val_fluid_label_fold,
+             layer_fluid_label_fold=val_layer_fluid_label_fold,
+             layer_area_label_fold=val_layer_area_label_fold,
+             ckp=ckp,
+             ly_classes=ly_classes,
+             pixel_ly_classes=pixel_ly_classes,
+             fl_classes=fl_classes,
+             one_hot=one_hot,
+             regression=regression,
+             eta=eta,
+             softargmax=softargmax,
+             multitask=multitask,
+             fluid_label=fluid_label,
+             target_size=target_size,
+             image_color_mode=image_color_mode)
+    elif action == 'train':
+        raise ValueError('only for testing step')
+
+
+
+def seed_torch(seed=3407):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+
+def run(
+        device_id='0',
+        action = 'test',
+        seed=8830,
+        dataset='retouch',
+        oct_device = 'Topcon',
+        root='./datasets',
+        backbone='resnetv2',  # resnetv2,vgg,resnet,convnext,swintrans,shuffletrans,mpvit
+        log_name='yifuyuan_bs_2_esares50unetv2_bn_adamw_acongelu_7layers_beta1_wIRF3s_tinyquadraatt_multitask_R_C_mul_ly_masks_diff51loss_fl_IN_test',
+        ckp_path='/data/whl/git_OCT/OCT_fluid_layer_seg/pytorch_ver/datasets/yifuyuan/result/yifuyuan_resnetv2_seed_8830'
+):
+    os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
+    # [401, 4517, 9879, 64, 2546]
+    # seedlist = np.random.randint(0,10000,5)
+    print(seed)
+    root = os.path.join(root, dataset, oct_device)
+    seed_torch(seed=seed)
+    # log_name = 'yifuyuan_bs_2_res50unetv2_bn_adamw_acon_7layers_beta1_single_task_LR_diff51loss_fl_IN_test'+ str(i)
+    if not log_name:
+        log_name = 'test_'+dataset + '_' + backbone + '_seed'
+        log_name = log_name + '_' + str(seed)
+    save_path = os.path.join(root, "result", log_name)
+    #ckp = os.path.join(ckp_path, 'weights_final.pth')
+    ckp = ckp_path
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    np.savetxt(os.path.join(save_path, 'seed.txt'), np.array([seed]), fmt='%d')
+    log_path = root + "/log/" + log_name
+    if not os.path.exists(log_path):
+        os.makedirs(log_path)
+
+    main(dataset=dataset,
+         oct_device=oct_device,
+         action=action,
+         pretraining=None,
+         tr_image_fold='flatted_IN_img_512',
+         tr_layer_label_fold='flatted_label_512/layers',
+         tr_fluid_label_fold='flatted_label_512/fluid3',
+         tr_layer_fluid_label_fold='flatted_label_512/covered',
+         tr_layer_area_label_fold='flatted_label_512/covered_wo_irf',
+         val_image_fold='flatted_IN_img_512',
+         val_layer_label_fold='flatted_label_512/layers',
+         val_fluid_label_fold='flatted_label_512/fluid3',
+         val_layer_fluid_label_fold='flatted_label_512/covered',
+         val_layer_area_label_fold='flatted_label_512/covered_wo_irf',
+         regression=True,
+         softargmax=True,
+         multitask=True,
+         fluid_label=True,
+         # eta=[0.1,0.3,0.3,0.5,0.3,0.3, 0.01],
+         eta=1,
+         backbone=backbone,  # resnetv2,vgg,resnet,convnext,swintrans,shuffletrans,mpvit
+         batch_size=2,
+         learning_rate=0.0001,
+         one_hot='y',
+         epoch=65,
+         target_size=(352, 512),
+         ly_classes=7,
+         pixel_ly_classes=8,
+         fl_classes=2,
+         ckp=ckp,
+         root=root,
+         save_path=save_path,
+         log_path=log_path)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='命令行参数示例')
+    parser.add_argument('--device_id', type=str, default='0', help='设备ID')
+    parser.add_argument('--dataset', type=str, default='retouch', help='dataset name')
+    parser.add_argument('--oct_device', type=str, default='Topcon', help='oct type')
+    parser.add_argument('--action', type=str, default='test', help='操作类型')
+    parser.add_argument('--seedlist', type=int, nargs='+', default=[8830], help='种子列表')
+    parser.add_argument('--root', type=str, default='./datasets', help='根目录路径')
+    parser.add_argument('--log_name', type=str, default=None, help='日志名称')
+    parser.add_argument('--ckp_path', type=str,
+                        default='/data/whl/git_OCT/OCT_fluid_layer_seg/pytorch_ver/datasets/yifuyuan/result/yifuyuan_resnetv2_seed_8830', help='ckp path')
+    parser.add_argument('--backbone', type=str, default='resnetv2', help='骨干网络')
+
+    args = parser.parse_args()
+    for seed in args.seedlist:
+        run(device_id=args.device_id,
+            action=args.action,
+            dataset=args.dataset,
+            seed=seed,
+            root=args.root,
+            log_name=args.log_name,
+            ckp_path=args.ckp_path,
+            backbone=args.backbone)
