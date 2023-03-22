@@ -2,7 +2,7 @@
 ## Multi-Task Joint Segmentation of Retinal Layers and Fluid Lesions in Optical Coherence Tomography ##
 ## 1. Environment
 - Please prepare an environment with python=3.7, and then use the command "pip install -r requirements.txt" for the dependencies.
-## 2. Prepare OCTA datasets 
+## 2. Prepare OCT datasets 
 #### (1) Run pre-processing step for OCT B-scans
 - The pre-processing step contains OCT flattening and intensity normalization.
 - An example of pre-processing on Duke dataset:
