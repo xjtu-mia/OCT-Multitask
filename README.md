@@ -25,11 +25,11 @@ python terminal.py --split_dataset --dataset duke
 - If you have done the above two steps for specific dataset, you can type the training and testing commands on the corresponding dataset given below:
 #### (1) Our clinical dataset
 ```bash
-python terminal.py --training --testing --dataset yifuyuan --backbone resnetv2
+python terminal.py --training --testing --dataset yifuyuan --backbone resnetv2 --epoch 65
 ```
 #### (2) Duke dataset
 ```bash
-python terminal.py --training --testing --dataset duke --backbone resnetv2
+python terminal.py --training --testing --dataset duke --backbone resnetv2 --epoch 65
 ```
 ## 4. Semi-supervised learning on Retouch dataset
 - To do this, You must first get a pre-training weights .pth file by training on a fully annotated dataset as a source dataset, like our clinical dataset.
@@ -47,7 +47,7 @@ python terminal.py --cross_valid --training --testing --dataset retouch --oct_de
 ```
 - Finally, if you want to verify the performance of semi-supervised model on the source dataset (our clinical dataset), you can execute the following two commands to merge the training sets of source and target dataset, then train the model on this merged training set and test it on the test set of the source data set:
 ```bash
-python terminal.py --merge_dataset --dataset retouch --oct_device Cirrus --k 6
+python terminal.py --merge_dataset --dataset retouch --oct_device Cirrus
 ```
 ```bash
 python terminal.py --training --testing --dataset retouch --oct_device Cirrus --backbone resnetv2 --epoch 25 --pretrain_path ./datasets/yifuyuan/result/yifuyuan_resnetv2_seed_8830/weights_final.pth
