@@ -25,11 +25,11 @@ python terminal.py --split_dataset --dataset duke
 - If you have done the above two steps for specific dataset, you can type the training and testing commands on the corresponding dataset given below:
 #### (1) Our clinical dataset
 ```bash
-python terminal.py --training --testing --dataset yifuyuan --backbone resnetv2 --seedlist 8830
+python terminal.py --training --testing --dataset yifuyuan --backbone resnetv2
 ```
 #### (2) Duke dataset
 ```bash
-python terminal.py --training --testing --dataset duke --backbone resnetv2 --seedlist 8830
+python terminal.py --training --testing --dataset duke --backbone resnetv2
 ```
 ## 4. Semi-supervised learning on Retouch dataset
 - To do this, You must first get a pre-training weight file by training on a fully annotated dataset, like our clinical dataset.
