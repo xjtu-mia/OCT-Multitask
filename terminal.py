@@ -19,7 +19,7 @@ parser.add_argument('--preprocessing', action='store_true',
 parser.add_argument('--dataset', default='yifuyuan', help="name of dataset, including yifuyuan, duke, retouch")
 parser.add_argument('--oct_device', default='Cirrus', help='OCT设备名称（仅当dataset为retouch时有效）')
 parser.add_argument('--root', default='./datasets', help='数据集的根目录')
-parser.add_argument('--bm3d_img_exist', action='store_true', help='是否存在BM3D图像')
+parser.add_argument('--bm3d_img_exist', action='store_true', help='是否已存在BM3D图像')
 parser.add_argument('--wo_cvx', action='store_true', help='是否使用CVX')
 
 
