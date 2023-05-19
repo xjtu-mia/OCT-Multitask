@@ -4,8 +4,7 @@ import torch.nn as nn
 import argparse
 from torch.utils.data import DataLoader
 from torch import autograd, optim
-from torch.optim.lr_scheduler import StepLR, MultiStepLR
-from torchsummary import summary
+
 
 from loss import DiceLoss, tversky_CEv2_loss_fun, categorical_crossentropy_v2, pcloss, PJcurvature
 from dataset_multitask import train_transform_data, val_transform_data, saveResult, drawmask, drawmask_truth
@@ -326,6 +325,11 @@ def train_model(model,
                 max_epoch=100,
                 eta=1,
                 k_size=51,
+                use_IB=True,
+                use_LR=True,
+                branch_num=3,
+                ST_LSR=False,
+                ST_PC=True,
                 regression=False,
                 softargmax=False,
                 multitask=False):
@@ -334,111 +338,76 @@ def train_model(model,
     step = 0
     mean_loss_list = np.zeros(9)
 
-    if multitask:
-        for x, y1, y2, y3, y4 in tqdm(dataload, ncols=80):
-            # for x, y in dataload:
-            step += 1
+    for x, y1, y2, y3, y4 in tqdm(dataload, ncols=80):
+        # for x, y in dataload:
+        step += 1
 
-            inputs = x.to(device)
-            labels_1 = y1.to(device)
-            labels_2 = y2.to(device)
-            labels_3 = y3.to(device)
-            labels_4 = y4.to(device)
-            label_diff = torch.tensor(savgol_filter(np.array(y1[:, -1, :]), 51, 2), dtype=torch.float).to(device)
-            # zero the parameter gradients
-            optimizer.zero_grad()
-            # forward
-            outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
-            # print(outputs)if classes == 1:
-            outputs_2 = outputs_1
-            outputs_2_0 = outputs_1_0
-            # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
-            h = labels_1.shape[2]
-            outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
-                                         max_epoch=max_epoch)
-            outputs_1 = posission_constraint(outputs_1)
+        inputs = x.to(device)
+        labels_1 = y1.to(device)
+        labels_2 = y2.to(device)
+        labels_3 = y3.to(device)
+        labels_4 = y4.to(device)
+        label_diff = torch.tensor(savgol_filter(np.array(y1[:, -1, :]), 51, 2), dtype=torch.float).to(device)
+        # zero the parameter gradients
+        optimizer.zero_grad()
+        # forward
+        outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
+        # print(outputs)if classes == 1:
+        outputs_2 = outputs_1
+        outputs_2_0 = outputs_1_0
+        # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
+        h = labels_1.shape[2]
+        outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                     max_epoch=max_epoch)
+        outputs_1 = posission_constraint(outputs_1)
 
-            pcurv_loss_1 = PJcurvature(device=device, k_size=k_size)(outputs_1[:, -1, :], label_diff)
-            outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
-                                           max_epoch=max_epoch)
-            outputs_1_0 = posission_constraint(outputs_1_0)
-            pcurv_loss_1_0 = PJcurvature(device=device, k_size=k_size)(outputs_1_0[:, -1, :], label_diff)
-            '''
-            不计算没有label点的loss，即output与label在该点始终具有相同值
-            '''
-            outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
-            outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
-            outputs_2 = nn.Softmax(dim=2)(outputs_2)
-            outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
-            outputs_3 = nn.Softmax(dim=1)(outputs_3)
-            outputs_4 = nn.Softmax(dim=1)(outputs_4)
-            loss_1 = criterion[0](outputs_1, labels_1)
-            loss_2 = criterion[1](outputs_2, labels_2)
-            loss_1_0 = criterion[0](outputs_1_0, labels_1)
-            loss_2_0 = criterion[1](outputs_2_0, labels_2)
-            loss_3 = criterion[2](outputs_3, labels_3)
-            loss_4 = criterion[3](outputs_4, labels_4)
-            # loss = u_loss(1 * loss_1, 1 * loss_1_0, 1 * loss_2, 1 * loss_2_0, 10 * loss_3, 10 * loss_4)
-            # print(pcurv_loss_1.requires_grad, pcurv_loss_1, pcurv_loss_1_0)
+        pcurv_loss_1 = PJcurvature(device=device, k_size=k_size)(outputs_1[:, -1, :], label_diff) if use_LR else torch.tensor([0]).to(device)
+        outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                       max_epoch=max_epoch)
+        outputs_1_0 = posission_constraint(outputs_1_0)
+        pcurv_loss_1_0 = PJcurvature(device=device, k_size=k_size)(outputs_1_0[:, -1, :], label_diff) if use_LR else torch.tensor([0]).to(device)
+        '''
+        不计算没有label点的loss，即output与label在该点始终具有相同值
+        '''
+        outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
+        outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
+        outputs_2 = nn.Softmax(dim=2)(outputs_2)
+        outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
+        outputs_3 = nn.Softmax(dim=1)(outputs_3)
+        outputs_4 = nn.Softmax(dim=1)(outputs_4)
+        loss_1 = criterion[0](outputs_1, labels_1)
+        loss_2 = criterion[1](outputs_2, labels_2)
+        loss_1_0 = criterion[0](outputs_1_0, labels_1)
+        loss_2_0 = criterion[1](outputs_2_0, labels_2)
+        loss_3 = criterion[2](outputs_3, labels_3)
+        loss_4 = criterion[3](outputs_4, labels_4) if use_IB else torch.tensor([0]).to(device)
+        # loss = u_loss(1 * loss_1, 1 * loss_1_0, 1 * loss_2, 1 * loss_2_0, 10 * loss_3, 10 * loss_4)
+        # print(pcurv_loss_1.requires_grad, pcurv_loss_1, pcurv_loss_1_0)
+        if branch_num == 3:
             loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4 + pcurv_loss_1 + pcurv_loss_1_0
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 20)
-            optimizer.step()
-            epoch_loss += loss.item()
-            loss_list = np.array([loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(),
-                                  loss_3.item(), loss_4.item(), pcurv_loss_1.item(), pcurv_loss_1_0.item(),
-                                  loss.item()])
-            mean_loss_list = mean_loss_list + loss_list
-            print("%d/%d,train_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
-            '''feature_output1 = model.featuremap1.cpu()
-            print(feature_output1.shape)
-            out = torchvision.tools.make_grid(feature_output1[0])
-            feature_imshow(out[:1])'''
-    else:
-        for x, y in tqdm(dataload, ncols=80):
-            # for x, y in dataload:
-            step += 1
-
-            inputs = x.to(device)
-            labels = y.to(device)
-            # print(labels.shape)
-            # zero the parameter gradients
-            optimizer.zero_grad()
-            # forward
-            outputs = model(inputs)
-            # print(outputs)
-            if ly_classes == 1:
-                outputs = nn.Sigmoid()(outputs)
-                loss = criterion(outputs, labels)
-            else:
-                # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
-                if not regression:
-                    outputs = nn.Softmax(dim=1)(outputs)
-                else:
-                    if softargmax:
-                        h = labels.shape[2]
-                        outputs = softargmax2d_col(outputs, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
-                                                   max_epoch=max_epoch)
-                        '''
-                        不计算没有label点的loss，即output与label在该点始终具有相同值
-                        '''
-                        outputs_ = torch.where(labels == 0, labels, outputs)
-                        # outputs = posission_constraint(outputs)
-                    else:
-                        outputs = nn.Softmax(dim=2)(outputs)
-                loss = criterion(outputs_, labels)
-
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            print("%d/%d,train_loss:%0.3f" % (step, (dt_size - 1) // dataload.batch_size + 1, loss.item()))
-    # scheduler.step()
-    print("第%d个epoch的lr, weight_decay：%f, %f" % (
-        epoch, optimizer.param_groups[0]['lr'], optimizer.param_groups[0]['weight_decay']))
-    mean_epoch_loss = epoch_loss / ((dt_size - 1) // dataload.batch_size + 1)
-    mean_loss_list = mean_loss_list / ((dt_size - 1) // dataload.batch_size + 1)
-    print("epoch %d mean_train_loss:" % (epoch), mean_loss_list)
+        elif branch_num == 2:
+            loss = 0 * loss_1 + 1 * loss_1_0 + 0 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4
+        elif branch_num == 1:
+            loss = 0 * loss_1 + 1 * loss_1_0 + 0 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 0 * loss_4
+            if ST_LSR:
+                loss = 0 * loss_1 + 1 * loss_1_0 + 0 * loss_2 + 1 * loss_2_0 + 0 * loss_3 + 0 * loss_4
+            elif ST_PC:
+                loss = 0 * loss_1 + 0 * loss_1_0 + 0 * loss_2 + 0 * loss_2_0 + 10 * loss_3 + 0 * loss_4
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 20)
+        optimizer.step()
+        epoch_loss += loss.item()
+        loss_list = np.array([loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(),
+                              loss_3.item(), loss_4.item(), pcurv_loss_1.item(), pcurv_loss_1_0.item(),
+                              loss.item()])
+        mean_loss_list = mean_loss_list + loss_list
+        print("%d/%d,train_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
+        '''feature_output1 = model.featuremap1.cpu()
+        print(feature_output1.shape)
+        out = torchvision.tools.make_grid(feature_output1[0])
+        feature_imshow(out[:1])'''
     return mean_loss_list, model
+
 
 
 def val_model(model,
@@ -452,6 +421,11 @@ def val_model(model,
               max_epoch=100,
               eta=1,
               k_size=51,
+              branch_num=3,
+                ST_LSR=False,
+                ST_PC=True,
+                use_IB=True,
+                use_LR=True,
               regression=False,
               softargmax=False,
               multitask=False):
@@ -476,126 +450,78 @@ def val_model(model,
         root_mean_square_error = {}
         for name in name_list:
             mean_absolute_distance[name] = 0
-        if multitask:
-            for x, y1, y2, y3, y4 in tqdm(dataload, ncols=60):
-                # for x, y in dataload:
-                step += 1
-                inputs = x.to(device)
-                labels_1 = y1.to(device)
-                labels_2 = y2.to(device)
-                labels_3 = y3.to(device)
-                labels_4 = y4.to(device)
-                label_diff = torch.tensor(savgol_filter(np.array(y1[:, -1, :]), 51, 2), dtype=torch.float).to(device)
-                # print(labels.shape)
-                # zero the parameter gradients
-                # forward
-                outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
-                # print(outputs)if classes == 1:
+        for x, y1, y2, y3, y4 in tqdm(dataload, ncols=60):
+            # for x, y in dataload:
+            step += 1
+            inputs = x.to(device)
+            labels_1 = y1.to(device)
+            labels_2 = y2.to(device)
+            labels_3 = y3.to(device)
+            labels_4 = y4.to(device)
+            label_diff = torch.tensor(savgol_filter(np.array(y1[:, -1, :]), 51, 2), dtype=torch.float).to(device)
+            # print(labels.shape)
+            # zero the parameter gradients
+            # forward
+            outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
+            # print(outputs)if classes == 1:
 
-                # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
-                h = labels_3.shape[2]
-                outputs_2 = outputs_1
-                outputs_2_0 = outputs_1_0
-                outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
-                                             max_epoch=max_epoch)
-                outputs_1 = posission_constraint(outputs_1)
-                pcurv_loss_1 = PJcurvature(device=device, k_size=k_size)(outputs_1[:, -1, :], label_diff)
-                outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
-                                               max_epoch=max_epoch)
-                outputs_1_0 = posission_constraint(outputs_1_0)
-                pcurv_loss_1_0 = PJcurvature(device=device, k_size=k_size)(outputs_1_0[:, -1, :], label_diff)
-                '''
-                不计算没有label点的loss，即output与label在该点始终具有相同值
-                '''
-                outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
-                outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
-                outputs_2 = nn.Softmax(dim=2)(outputs_2)
-                outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
-                outputs_3 = nn.Softmax(dim=1)(outputs_3)
-                outputs_4 = nn.Softmax(dim=1)(outputs_4)
-                loss_1 = criterion[0](outputs_1, labels_1)
-                loss_1_0 = criterion[0](outputs_1_0, labels_1)
-                loss_2 = criterion[1](outputs_2, labels_2)
-                loss_2_0 = criterion[1](outputs_2_0, labels_2)
-                loss_3 = criterion[2](outputs_3, labels_3)
-                loss_4 = criterion[3](outputs_4, labels_4)
+            # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
+            h = labels_3.shape[2]
+            outputs_2 = outputs_1
+            outputs_2_0 = outputs_1_0
+            outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                         max_epoch=max_epoch)
+            outputs_1 = posission_constraint(outputs_1)
+            pcurv_loss_1 = PJcurvature(device=device, k_size=k_size)(outputs_1[:, -1, :], label_diff) if use_LR else torch.tensor([0]).to(device)
+            outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
+                                           max_epoch=max_epoch)
+            outputs_1_0 = posission_constraint(outputs_1_0)
+            pcurv_loss_1_0 = PJcurvature(device=device, k_size=k_size)(outputs_1_0[:, -1, :], label_diff) if use_LR else torch.tensor([0]).to(device)
+            '''
+            不计算没有label点的loss，即output与label在该点始终具有相同值
+            '''
+            outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
+            outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
+            outputs_2 = nn.Softmax(dim=2)(outputs_2)
+            outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
+            outputs_3 = nn.Softmax(dim=1)(outputs_3)
+            outputs_4 = nn.Softmax(dim=1)(outputs_4)
+            loss_1 = criterion[0](outputs_1, labels_1)
+            loss_1_0 = criterion[0](outputs_1_0, labels_1)
+            loss_2 = criterion[1](outputs_2, labels_2)
+            loss_2_0 = criterion[1](outputs_2_0, labels_2)
+            loss_3 = criterion[2](outputs_3, labels_3)
+            loss_4 = criterion[3](outputs_4, labels_4) if use_IB else torch.tensor([0]).to(device)
+            if branch_num == 3:
                 loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4 + pcurv_loss_1 + pcurv_loss_1_0
-                loss_list = np.array(
-                    [loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(), loss_3.item(), loss_4.item(),
-                     pcurv_loss_1.item(), pcurv_loss_1_0.item(), loss.item()])
-                mean_loss_list = mean_loss_list + loss_list
-                epoch_loss += loss.item()
+            elif branch_num == 2:
+                loss = 0 * loss_1 + 1 * loss_1_0 + 0 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4
+            elif branch_num == 1:
+                loss = 0 * loss_1 + 1 * loss_1_0 + 0 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 0 * loss_4
+                if ST_LSR:
+                    loss = 0 * loss_1 + 1 * loss_1_0 + 0 * loss_2 + 1 * loss_2_0 + 0 * loss_3 + 0 * loss_4
+                elif ST_PC:
+                    loss = 0 * loss_1 + 0 * loss_1_0 + 0 * loss_2 + 0 * loss_2_0 + 10 * loss_3 + 0 * loss_4
+            loss_list = np.array(
+                [loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(), loss_3.item(), loss_4.item(),
+                 pcurv_loss_1.item(), pcurv_loss_1_0.item(), loss.item()])
+            mean_loss_list = mean_loss_list + loss_list
+            epoch_loss += loss.item()
 
-                print("%d/%d,val_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
-                img_y_ly = outputs_1.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_true_ly = labels_1.cpu().numpy()
-                tmp_mad = tmp_mad + MAD(img_y_ly, img_true_ly, softargmax=softargmax)
-                tmp_rmse = tmp_rmse + RMSE(img_y_ly, img_true_ly, softargmax=softargmax)
+            print("%d/%d,val_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
+            img_y_ly = outputs_1.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+            img_true_ly = labels_1.cpu().numpy()
+            tmp_mad = tmp_mad + MAD(img_y_ly, img_true_ly, softargmax=softargmax)
+            tmp_rmse = tmp_rmse + RMSE(img_y_ly, img_true_ly, softargmax=softargmax)
 
-                img_y_ly = torch2tensor(img_y_ly)
-                img_arr_ly[n] = img_y_ly[0]
+            img_y_ly = torch2tensor(img_y_ly)
+            img_arr_ly[n] = img_y_ly[0]
 
-                img_y_fl = outputs_4.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_true_fl = labels_4.cpu().numpy()
-                img_y_fl = torch2tensor(img_y_fl)
-                img_arr_fl[n] = img_y_fl[0]
-                n += 1
-        else:
-            for x, y in tqdm(dataload, ncols=60):
-                step += 1
-                inputs = x.to(device)
-                labels = y.to(device)
-                # forward
-                outputs = model(inputs)
-                # print(outputs)
-                if ly_classes == 1:
-                    outputs = nn.Sigmoid()(outputs)
-                    loss = criterion(outputs, labels)
-                else:
-                    # labels = labels.squeeze(1)  #使用内置的交叉熵函数时需要压缩维度，且不需要softmax
-                    if not regression:
-                        outputs = nn.Softmax(dim=1)(outputs)
-                    else:
-                        if softargmax:
-                            h = labels.shape[2]
-                            outputs = softargmax2d_col(outputs, dim=2, eta=eta, dynamic_beta=False, epoch=epoch,
-                                                       max_epoch=max_epoch)
-                            '''
-                            不计算没有label点的loss，即output与label在该点始终具有相同值
-                            '''
-                            outputs_ = torch.where(labels == 0, labels, outputs)
-                            # outputs = posission_constraint(outputs)
-                        else:
-                            outputs = nn.Softmax(dim=2)(outputs)
-                    loss = criterion(outputs_, labels)
-
-                epoch_loss += loss.item()
-                print("%d/%d,val_loss:%0.3f" % (step, (dt_size - 1) // dataload.batch_size + 1, loss.item()))
-                img_y = outputs.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_y = torch2tensor(img_y)
-                img_arr_ly[n] = img_y[0]
-                n += 1
-        mean_epoch_loss = epoch_loss / ((dt_size - 1) // dataload.batch_size + 1)
-        mean_loss_list = mean_loss_list / ((dt_size - 1) // dataload.batch_size + 1)
-        tmp_mad = tmp_mad / len(dataload.dataset)
-        tmp_rmse = tmp_rmse / len(dataload.dataset)
-        print(len(dataload.dataset))
-        for i, name in enumerate(name_list):
-            if name == 'mean':
-                mmad = 0
-                mrmse = 0
-                for value in mean_absolute_distance.values():
-                    mmad += value
-                mmad = mmad / (len(name_list) - 1)
-                mean_absolute_distance[name] = mmad
-                for value in root_mean_square_error.values():
-                    mrmse += value
-                mrmse = mrmse / (len(name_list) - 1)
-                root_mean_square_error[name] = mrmse
-            else:
-                mean_absolute_distance[name] = tmp_mad[i]
-                root_mean_square_error[name] = tmp_rmse[i]
-        print("epoch %d mean_val_loss:" % (epoch), mean_loss_list)
+            img_y_fl = outputs_4.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+            img_true_fl = labels_4.cpu().numpy()
+            img_y_fl = torch2tensor(img_y_fl)
+            img_arr_fl[n] = img_y_fl[0]
+            n += 1
 
     return mean_loss_list, img_arr_ly, img_arr_fl, mean_absolute_distance, root_mean_square_error
 
@@ -626,6 +552,12 @@ def train(root=None,
           fluid_label=False,
           eta=1,
           k_size=51,
+        branch_num=3,
+        ST_LSR=False,
+        ST_PC=True,
+        use_LR=True,
+        use_RGM=True,
+        use_IB=True,
           max_epoch=20,
           target_size=(512, 512),
           num_workers=0,
@@ -668,9 +600,15 @@ def train(root=None,
     '''
     print('using %s backbone' % backbone)
     if backbone == 'resnetv2':
-        from multitask_models.multitask_resnestv2 import \
-            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_resUnet_ly_masks
-        model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+        if branch_num > 1:
+            from multitask_models.multitask_resnestv2 import \
+                tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_resUnet_ly_masks
+            model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                  multitask=multitask, use_RGM=use_RGM).to(device)
+        else:
+            from multitask_models.multitask_resnestv2 import \
+                R50_Unet as tinyquadra_multi_resUnet_ly_masks
+            model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
                                                   multitask=multitask).to(device)
     elif backbone == 'vgg':
         from multitask_models.multitask_VGG import \
@@ -678,7 +616,7 @@ def train(root=None,
         model = tinyquadra_multi_vggUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
                                                   multitask=multitask).to(device)
     elif backbone == 'resnet':
-        from multitask_models.multitask_resnestv2 import R50_Unet as tinyquadra_multi_oresUnet_ly_masks
+        from multitask_models.multitask_resnest import tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_oresUnet_ly_masks
         model = tinyquadra_multi_oresUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
                                                    multitask=multitask).to(device)
     elif backbone == 'convnext':
@@ -782,11 +720,6 @@ def train(root=None,
     '''
     selecting optimizer
     '''
-    weighted_loss_func = UncertaintyLoss(6)
-    weighted_loss_func.to(device)
-    optimizer = optim.AdamW(
-        filter(lambda x: x.requires_grad, list(model.parameters()) + list(weighted_loss_func.parameters())),
-        lr=learning_rate, weight_decay=learning_rate)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=learning_rate)
     # scheduler = MultiStepLR(optimizer,
     #                        milestones=[int(max_epoch*0.5), int(max_epoch*0.7), int(max_epoch*0.9)],
@@ -855,6 +788,11 @@ def train(root=None,
                                               max_epoch=max_epoch,
                                               eta=eta,
                                               k_size=k_size,
+                                              use_IB=use_IB,
+                                              use_LR=use_LR,
+                                              branch_num=branch_num,
+                                              ST_LSR=ST_LSR,
+                                              ST_PC=ST_PC,
                                               regression=regression,
                                               softargmax=softargmax,
                                               multitask=multitask)
@@ -871,8 +809,6 @@ def train(root=None,
         # writer.add_graph(model, torch.randn(1,1,448,448).to(torch.device('cuda')))
         lr_decay(optimizer, epoch, method='poly', warm_epoch=0, max_epoch=max_epoch, initial_lr=learning_rate,
                  power=1.5)
-        if train_epoch_loss[-1] >= 150:
-            return train_epoch_loss[-1]
         val_epoch_loss, img_arr_ly, img_arr_fl, mean_absolute_distance, root_mean_square_error = val_model(model,
                                                                                                            criterion,
                                                                                                            dataloaders_val,
@@ -993,6 +929,12 @@ def test(root=None,
          multitask=False,
          fluid_label=False,
          eta=1,
+        branch_num=4,
+        ST_LSR=False,
+        ST_PC=True,
+        use_LR=True,
+        use_RGM=True,
+        use_IB=True,
          target_size=(512, 512),
          image_color_mode='gray'):
     print('testing...')
@@ -1002,17 +944,23 @@ def test(root=None,
         channel = 3
     device = torch.device("cuda")
     if backbone == 'resnetv2':
-        from multitask_models.multitask_resnestv2 import \
-            tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_resUnet_ly_masks
-        model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
-                                                  multitask=multitask).to(device)
+        if branch_num > 1:
+            from multitask_models.multitask_resnestv2 import \
+                tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_resUnet_ly_masks
+            model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                      multitask=multitask, use_RGM=use_RGM).to(device)
+        else:
+            from multitask_models.multitask_resnestv2 import \
+                R50_Unet as tinyquadra_multi_resUnet_ly_masks
+            model = tinyquadra_multi_resUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
+                                                      multitask=multitask).to(device)
     elif backbone == 'vgg':
         from multitask_models.multitask_VGG import \
             tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_vggUnet_ly_masks
         model = tinyquadra_multi_vggUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
                                                   multitask=multitask).to(device)
     elif backbone == 'resnet':
-        from multitask_models.multitask_resnestv2 import R50_Unet as tinyquadra_multi_oresUnet_ly_masks
+        from multitask_models.multitask_resnest import tinyquadra_multi_resUnet_ly_masks_s3 as tinyquadra_multi_oresUnet_ly_masks
         model = tinyquadra_multi_oresUnet_ly_masks(channel, ly_classes, pixel_ly_classes, fl_classes,
                                                    multitask=multitask).to(device)
     elif backbone == 'convnext':
@@ -1090,213 +1038,213 @@ def test(root=None,
         mean_loss_list = np.zeros(7)
         tmp_mad = np.zeros((len(name_list) - 1))
         tmp_rmse = np.zeros((len(name_list) - 1))
-        if multitask:
-            for x, y1, y2, y3, y4 in tqdm(dataload, ncols=60):
-                step += 1
-                inputs = x.to(device)
-                labels_1 = y1.to(device)
-                labels_2 = y2.to(device)
-                labels_3 = y3.to(device)
-                labels_4 = y4.to(device)
-                outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
-                '''feature_output1 = model.featuremap1.transpose(1, 0).cpu()
 
-                out = torchvision.tools.make_grid(feature_output1)
-                feature_imshow(out)'''
+        for x, y1, y2, y3, y4 in tqdm(dataload, ncols=60):
+            step += 1
+            inputs = x.to(device)
+            labels_1 = y1.to(device)
+            labels_2 = y2.to(device)
+            labels_3 = y3.to(device)
+            labels_4 = y4.to(device)
+            outputs_1, outputs_1_0, outputs_3, outputs_4 = model(inputs)
+            '''feature_output1 = model.featuremap1.transpose(1, 0).cpu()
 
-                h = outputs_1.shape[2]
-                outputs_2 = outputs_1
-                outputs_2_0 = outputs_1_0
-                img_y_ly_area, _ = masks_from_regression1(outputs_1,
-                                                          eta=1, dim=2, device='cuda',
-                                                          add=False, convexhull=False).run()
-                outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta)
-                outputs_1 = posission_constraint(outputs_1)
-                outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta)
-                outputs_1_0 = posission_constraint(outputs_1_0)
-                outputs_2 = nn.Softmax(dim=2)(outputs_2)
-                outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
-                outputs_3 = nn.Softmax(dim=1)(outputs_3)
-                outputs_4 = nn.Softmax(dim=1)(outputs_4)
-                outputs_1_ = outputs_1
-                outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
-                outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
-                criterion_1 = nn.SmoothL1Loss(beta=1)
-                criterion_2 = categorical_crossentropy_v2(w=1)
-                if dataset == 'duke':
-                    alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                    beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                    w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+            out = torchvision.tools.make_grid(feature_output1)
+            feature_imshow(out)'''
+
+            h = outputs_1.shape[2]
+            outputs_2 = outputs_1
+            outputs_2_0 = outputs_1_0
+            img_y_ly_area, _ = masks_from_regression1(outputs_1,
+                                                      eta=1, dim=2, device='cuda',
+                                                      add=False, convexhull=False).run()
+            outputs_1 = softargmax2d_col(outputs_1, dim=2, eta=eta)
+            outputs_1 = posission_constraint(outputs_1)
+            outputs_1_0 = softargmax2d_col(outputs_1_0, dim=2, eta=eta)
+            outputs_1_0 = posission_constraint(outputs_1_0)
+            outputs_2 = nn.Softmax(dim=2)(outputs_2)
+            outputs_2_0 = nn.Softmax(dim=2)(outputs_2_0)
+            outputs_3 = nn.Softmax(dim=1)(outputs_3)
+            outputs_4 = nn.Softmax(dim=1)(outputs_4)
+            outputs_1_ = outputs_1
+            outputs_1 = torch.where(labels_1 == 0, labels_1, outputs_1)
+            outputs_1_0 = torch.where(labels_1 == 0, labels_1, outputs_1_0)
+            criterion_1 = nn.SmoothL1Loss(beta=1)
+            criterion_2 = categorical_crossentropy_v2(w=1)
+            if dataset == 'duke':
+                alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                gamma = 0.4
+            elif dataset == 'yifuyuan':
+                if pixel_ly_classes == ly_classes:
+                    alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
                     gamma = 0.4
-                elif dataset == 'yifuyuan':
-                    if pixel_ly_classes == ly_classes:
-                        alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                        beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                        w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                        gamma = 0.4
-                    else:
-                        alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                        beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
-                        w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2]
-                        gamma = 0.4
-                criterion_3 = tversky_CEv2_loss_fun(alpha=alpha,
-                                                    beta=beta,
-                                                    w=w,
-                                                    gamma=gamma)
-                criterion_4 = tversky_CEv2_loss_fun(alpha=[0.5, 0.5],
-                                                    beta=[0.5, 0.5],
-                                                    w=[0.5, 2],
-                                                    gamma=0.4)
-                criterion = (criterion_1, criterion_2, criterion_3, criterion_4)
-                loss_1 = criterion[0](outputs_1, labels_1).cpu().numpy()
-                loss_2 = criterion[1](outputs_2, labels_2).cpu().numpy()
-                loss_1_0 = criterion[0](outputs_1_0, labels_1).cpu().numpy()
-                loss_2_0 = criterion[1](outputs_2_0, labels_2).cpu().numpy()
-                loss_3 = criterion[2](outputs_3, labels_3).cpu().numpy()
-                loss_4 = criterion[3](outputs_4, labels_4).cpu().numpy()
-                loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4
-                loss_list = np.array(
-                    [loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(), loss_3.item(), loss_4.item(),
-                     loss.item()])
-                print("%d/%d,test_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
-                img_y_ly = outputs_1.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_y_ly_ = outputs_1_.cpu().numpy()
-                img_true = labels_1.cpu().numpy()
-                tmp_mad = tmp_mad + MAD(img_y_ly, img_true, softargmax=softargmax) * 3.91
-                tmp_rmse = tmp_rmse + RMSE(img_y_ly, img_true, softargmax=softargmax) * 3.91
-
-                img_y_ly = index2img(img_y_ly_, target_size=target_size)
-                img_y_ly = torch2tensor(img_y_ly)
-                img_arr_ly[n] = img_y_ly[0]
-                img_y_fl = outputs_4.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_y_fl = torch2tensor(img_y_fl)
-                img_arr_fl[n] = img_y_fl[0]
-                img_y_lyfl = outputs_3.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_y_lyfl = torch2tensor(img_y_lyfl)
-                img_arr_lyfl[n] = img_y_lyfl[0]
-                img_y_ly_area = img_y_ly_area.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
-                img_y_ly_area = torch2tensor(img_y_ly_area)
-                img_arr_ly_area[n, :, :, 1:] = img_y_ly_area[0]
-                n += 1
-                mean_loss = mean_loss + loss
-                mean_loss_list = mean_loss_list + loss_list
-            mean_loss = mean_loss / len(dataload.dataset)
-            mean_loss_list = mean_loss_list / len(dataload.dataset)
-            print(mean_loss_list)
-            test_path = os.path.join(root, 'val', image_fold)
-            groundtruth_path = os.path.join(root, 'val', fluid_label_fold.split('/')[0])
-            tmp_mad = tmp_mad / len(dataload.dataset)
-            tmp_rmse = tmp_rmse / len(dataload.dataset)
-            print(len(dataload.dataset))
-            for i, name in enumerate(name_list):
-                if name == 'mean':
-                    mmad = 0
-                    mrmse = 0
-                    for value in mean_absolute_distance.values():
-                        mmad += value
-                    mmad = mmad / (len(name_list) - 1)
-                    mean_absolute_distance[name] = mmad
-                    for value in root_mean_square_error.values():
-                        mrmse += value
-                    mrmse = mrmse / (len(name_list) - 1)
-                    root_mean_square_error[name] = mrmse
                 else:
-                    mean_absolute_distance[name] = tmp_mad[i]
-                    root_mean_square_error[name] = tmp_rmse[i]
-            print(mean_absolute_distance)
-            results_item = {'MAD': [list(mean_absolute_distance.values()), list(mean_absolute_distance.keys())],
-                            'RMSE': [list(root_mean_square_error.values()), list(root_mean_square_error.keys())]}
-            '''save_to_exel2(list(mean_absolute_distance.values()), list(mean_absolute_distance.keys()),
-                          os.path.join(save_path, 'results.xlsx'), start_row=0, tag='MAD')
-            save_to_exel2(list(root_mean_square_error.values()), list(root_mean_square_error.keys()),
-                          os.path.join(save_path, 'results.xlsx'), start_row=2, tag='RMSE')'''
-            saveResult(save_path,
-                       test_path,
-                       target_size,
-                       npyfile_ly=img_arr_ly,
-                       npyfile_fl=img_arr_fl,
-                       npyfile_ly_fl=img_arr_lyfl,
-                       npyfile_ly_area=img_arr_ly_area,
-                       flag_multi_class=True,
+                    alpha = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    beta = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+                    w = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2]
+                    gamma = 0.4
+            criterion_3 = tversky_CEv2_loss_fun(alpha=alpha,
+                                                beta=beta,
+                                                w=w,
+                                                gamma=gamma)
+            criterion_4 = tversky_CEv2_loss_fun(alpha=[0.5, 0.5],
+                                                beta=[0.5, 0.5],
+                                                w=[0.5, 2],
+                                                gamma=0.4)
+            criterion = (criterion_1, criterion_2, criterion_3, criterion_4)
+            loss_1 = criterion[0](outputs_1, labels_1).cpu().numpy()
+            loss_2 = criterion[1](outputs_2, labels_2).cpu().numpy()
+            loss_1_0 = criterion[0](outputs_1_0, labels_1).cpu().numpy()
+            loss_2_0 = criterion[1](outputs_2_0, labels_2).cpu().numpy()
+            loss_3 = criterion[2](outputs_3, labels_3).cpu().numpy()
+            loss_4 = criterion[3](outputs_4, labels_4).cpu().numpy()
+            loss = 1 * loss_1 + 1 * loss_1_0 + 1 * loss_2 + 1 * loss_2_0 + 10 * loss_3 + 10 * loss_4
+            loss_list = np.array(
+                [loss_1.item(), loss_1_0.item(), loss_2.item(), loss_2_0.item(), loss_3.item(), loss_4.item(),
+                 loss.item()])
+            print("%d/%d,test_loss:" % (step, (dt_size - 1) // dataload.batch_size + 1), loss_list)
+            img_y_ly = outputs_1.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+            img_y_ly_ = outputs_1_.cpu().numpy()
+            img_true = labels_1.cpu().numpy()
+            tmp_mad = tmp_mad + MAD(img_y_ly, img_true, softargmax=softargmax) * 3.91
+            tmp_rmse = tmp_rmse + RMSE(img_y_ly, img_true, softargmax=softargmax) * 3.91
+
+            img_y_ly = index2img(img_y_ly_, target_size=target_size)
+            img_y_ly = torch2tensor(img_y_ly)
+            img_arr_ly[n] = img_y_ly[0]
+            img_y_fl = outputs_4.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+            img_y_fl = torch2tensor(img_y_fl)
+            img_arr_fl[n] = img_y_fl[0]
+            img_y_lyfl = outputs_3.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+            img_y_lyfl = torch2tensor(img_y_lyfl)
+            img_arr_lyfl[n] = img_y_lyfl[0]
+            img_y_ly_area = img_y_ly_area.cpu().numpy()  # cuda输出的tensor无法直接进行numpy操作，因此需要转换成cpu tensor
+            img_y_ly_area = torch2tensor(img_y_ly_area)
+            img_arr_ly_area[n, :, :, 1:] = img_y_ly_area[0]
+            n += 1
+            mean_loss = mean_loss + loss
+            mean_loss_list = mean_loss_list + loss_list
+        mean_loss = mean_loss / len(dataload.dataset)
+        mean_loss_list = mean_loss_list / len(dataload.dataset)
+        print(mean_loss_list)
+        test_path = os.path.join(root, 'val', image_fold)
+        groundtruth_path = os.path.join(root, 'val', fluid_label_fold.split('/')[0])
+        tmp_mad = tmp_mad / len(dataload.dataset)
+        tmp_rmse = tmp_rmse / len(dataload.dataset)
+        print(len(dataload.dataset))
+        for i, name in enumerate(name_list):
+            if name == 'mean':
+                mmad = 0
+                mrmse = 0
+                for value in mean_absolute_distance.values():
+                    mmad += value
+                mmad = mmad / (len(name_list) - 1)
+                mean_absolute_distance[name] = mmad
+                for value in root_mean_square_error.values():
+                    mrmse += value
+                mrmse = mrmse / (len(name_list) - 1)
+                root_mean_square_error[name] = mrmse
+            else:
+                mean_absolute_distance[name] = tmp_mad[i]
+                root_mean_square_error[name] = tmp_rmse[i]
+        print(mean_absolute_distance)
+        results_item = {'MAD': [list(mean_absolute_distance.values()), list(mean_absolute_distance.keys())],
+                        'RMSE': [list(root_mean_square_error.values()), list(root_mean_square_error.keys())]}
+        '''save_to_exel2(list(mean_absolute_distance.values()), list(mean_absolute_distance.keys()),
+                      os.path.join(save_path, 'results.xlsx'), start_row=0, tag='MAD')
+        save_to_exel2(list(root_mean_square_error.values()), list(root_mean_square_error.keys()),
+                      os.path.join(save_path, 'results.xlsx'), start_row=2, tag='RMSE')'''
+        saveResult(save_path,
+                   test_path,
+                   target_size,
+                   npyfile_ly=img_arr_ly,
+                   npyfile_fl=img_arr_fl,
+                   npyfile_ly_fl=img_arr_lyfl,
+                   npyfile_ly_area=img_arr_ly_area,
+                   flag_multi_class=True,
+                   ly_classes=ly_classes,
+                   pixel_ly_classes=pixel_ly_classes,
+                   fl_classes=fl_classes,
+                   regression=regression)
+        drawmask(test_path,
+                 save_path,
+                 ly_classes=ly_classes,
+                 pixel_ly_classes=pixel_ly_classes,
+                 fl_classes=fl_classes,
+                 target_size=target_size,
+                 regression=regression,
+                 split_IRF=True if branch_num>1 and use_IB else False,
+                 task='index2area')  # visualization-
+        drawmask_truth(test_path,
+                       groundtruth_path,
+                       save_path,
                        ly_classes=ly_classes,
                        pixel_ly_classes=pixel_ly_classes,
                        fl_classes=fl_classes,
+                       target_size=target_size,
                        regression=regression)
-            drawmask(test_path,
-                     save_path,
-                     ly_classes=ly_classes,
-                     pixel_ly_classes=pixel_ly_classes,
-                     fl_classes=fl_classes,
-                     target_size=target_size,
-                     regression=regression,
-                     split_IRF=False,
-                     task='index2area')  # visualization-
-            drawmask_truth(test_path,
-                           groundtruth_path,
-                           save_path,
-                           ly_classes=ly_classes,
-                           pixel_ly_classes=pixel_ly_classes,
-                           fl_classes=fl_classes,
+        au_dict_fl = evl(img_arr_fl,
+                         method='f1',
+                         threshold_num=33,
+                         classes=fl_classes,
+                         target_size=target_size,
+                         flag_multi_class=True,
+                         groundtruth_path=os.path.join(root, 'val', fluid_label_fold),
+                         save_path=save_path)
+        # print(au_dict)
+        au_dict_lyfl = evl(img_arr_lyfl,
+                           method='f1',
+                           threshold_num=33,
+                           classes=pixel_ly_classes,
                            target_size=target_size,
-                           regression=regression)
-            au_dict_fl = evl(img_arr_fl,
-                             method='f1',
-                             threshold_num=33,
-                             classes=fl_classes,
-                             target_size=target_size,
-                             flag_multi_class=True,
-                             groundtruth_path=os.path.join(root, 'val', fluid_label_fold),
-                             save_path=save_path)
-            # print(au_dict)
-            au_dict_lyfl = evl(img_arr_lyfl,
-                               method='f1',
-                               threshold_num=33,
-                               classes=pixel_ly_classes,
-                               target_size=target_size,
-                               flag_multi_class=True,
-                               groundtruth_path=os.path.join(root, 'val', layer_fluid_label_fold),
-                               save_path=save_path)
-            # print(au_dict_lyfl)
-            au_dict_lyfl['class_name'].append('IRF branch')
-            au_dict_lyfl['F1-score'] += au_dict_fl['F1-score']
-            au_dict_lyfl['class_name'].append('mean')
-            au_dict_lyfl['F1-score'].append(
-                sum(au_dict_lyfl['F1-score'][:-2] + au_dict_fl['F1-score']) / (pixel_ly_classes - 1))
-            results_item['F1-score'] = [au_dict_lyfl['F1-score'], au_dict_lyfl['class_name']]
-            '''save_to_exel2(au_dict_lyfl['F1-score'], au_dict_lyfl['class_name'], 
-                          os.path.join(save_path, 'results.xlsx'), start_row=6, tag='F1-score')'''
-            au_dict_ly = evl(img_arr_ly_area,
-                             method='f1',
-                             task='index2area',
-                             threshold_num=33,
-                             classes=ly_classes,
-                             target_size=target_size,
-                             flag_multi_class=True,
-                             groundtruth_path=os.path.join(root, 'val', layer_area_label_fold),
-                             save_path=save_path)
-            au_dict_ly['class_name'].append('mean')
-            au_dict_ly['F1-score'] += [au_dict_ly['mean_F1']]
-            au_dict_ly['class_name'].append('mean_irf')
-            au_dict_ly['F1-score'].append(
-                sum(au_dict_ly['F1-score'][:-1] + au_dict_fl['F1-score']) / (pixel_ly_classes - 1))
-            results_item['Reg F1-score'] = [au_dict_ly['F1-score'], au_dict_ly['class_name']]
-            save_to_exel2(results_item, os.path.join(save_path, 'results.xls'))
-        with open(os.path.join(save_path, 'test_results.json'), 'a') as outfile:
-            outfile.seek(0)
-            outfile.truncate()  # 清空文件
-            json.dump({'loss': mean_loss_list.tolist()}, outfile, ensure_ascii=False, indent=4)
+                           flag_multi_class=True,
+                           groundtruth_path=os.path.join(root, 'val', layer_fluid_label_fold),
+                           save_path=save_path)
+        # print(au_dict_lyfl)
+        au_dict_lyfl['class_name'].append('IRF branch')
+        au_dict_lyfl['F1-score'] += au_dict_fl['F1-score']
+        au_dict_lyfl['class_name'].append('mean')
+        au_dict_lyfl['F1-score'].append(
+            sum(au_dict_lyfl['F1-score'][:-2] + au_dict_fl['F1-score']) / (pixel_ly_classes - 1))
+        results_item['F1-score'] = [au_dict_lyfl['F1-score'], au_dict_lyfl['class_name']]
+        '''save_to_exel2(au_dict_lyfl['F1-score'], au_dict_lyfl['class_name'], 
+                      os.path.join(save_path, 'results.xlsx'), start_row=6, tag='F1-score')'''
+        au_dict_ly = evl(img_arr_ly_area,
+                         method='f1',
+                         task='index2area',
+                         threshold_num=33,
+                         classes=ly_classes,
+                         target_size=target_size,
+                         flag_multi_class=True,
+                         groundtruth_path=os.path.join(root, 'val', layer_area_label_fold),
+                         save_path=save_path)
+        au_dict_ly['class_name'].append('mean')
+        au_dict_ly['F1-score'] += [au_dict_ly['mean_F1']]
+        au_dict_ly['class_name'].append('mean_irf')
+        au_dict_ly['F1-score'].append(
+            sum(au_dict_ly['F1-score'][:-1] + au_dict_fl['F1-score']) / (pixel_ly_classes - 1))
+        results_item['Reg F1-score'] = [au_dict_ly['F1-score'], au_dict_ly['class_name']]
+        save_to_exel2(results_item, os.path.join(save_path, 'results.xls'))
+    with open(os.path.join(save_path, 'test_results.json'), 'a') as outfile:
+        outfile.seek(0)
+        outfile.truncate()  # 清空文件
+        json.dump({'loss': mean_loss_list.tolist()}, outfile, ensure_ascii=False, indent=4)
+        outfile.write('\n')
+        if regression:
+            json.dump({'MAD': mean_absolute_distance}, outfile, ensure_ascii=False, indent=4)
             outfile.write('\n')
-            if regression:
-                json.dump({'MAD': mean_absolute_distance}, outfile, ensure_ascii=False, indent=4)
-                outfile.write('\n')
-                json.dump({'RMSE': root_mean_square_error}, outfile, ensure_ascii=False, indent=4)
-                outfile.write('\n')
+            json.dump({'RMSE': root_mean_square_error}, outfile, ensure_ascii=False, indent=4)
+            outfile.write('\n')
 
-        # drawmask_truth(test_path, groundtruth_path, save_path, classes=classes,target_size=target_size)
+    # drawmask_truth(test_path, groundtruth_path, save_path, classes=classes,target_size=target_size)
 
-        # plt.imshow(img_y)
-        # plt.pause(0.1)
-        # plt.show()
+    # plt.imshow(img_y)
+    # plt.pause(0.1)
+    # plt.show()
 
 
 '''
@@ -1338,6 +1286,12 @@ def main(dataset='duke',
          fluid_label=True,
          eta=1,
          k_size=51,
+        branch_num=4,
+        ST_LSR=False,
+        ST_PC=True,
+        use_LR=True,
+        use_RGM=True,
+        use_IB=True,
          backbone='resnetv2',
          batch_size=2,
          one_hot='y',
@@ -1371,6 +1325,12 @@ def main(dataset='duke',
              one_hot=one_hot,
              regression=regression,
              eta=eta,
+             branch_num=branch_num,
+             ST_LSR=ST_LSR,
+             ST_PC=ST_PC,
+             use_LR=use_LR,
+             use_RGM=use_RGM,
+             use_IB=use_IB,
              softargmax=softargmax,
              multitask=multitask,
              fluid_label=fluid_label,
@@ -1402,6 +1362,12 @@ def main(dataset='duke',
                            fluid_label=fluid_label,
                            eta=eta,
                            k_size=k_size,
+                           branch_num=branch_num,
+                           ST_LSR=ST_LSR,
+                           ST_PC=ST_PC,
+                           use_LR=use_LR,
+                           use_RGM=use_RGM,
+                           use_IB=use_IB,
                            max_epoch=epoch,
                            target_size=target_size,
                            writer=writer,
@@ -1452,7 +1418,13 @@ def run(
         root='./datasets',
         backbone='resnetv2',  # resnetv2,vgg,resnet,convnext,swintrans,shuffletrans,mpvit
         log_name='yifuyuan_bs_2_esares50unetv2_bn_adamw_acongelu_7layers_beta1_wIRF3s_tinyquadraatt_multitask_R_C_mul_ly_masks_diff51loss_fl_IN_test',
-        k_size=51
+        k_size=51,
+        branch_num=4,
+        ST_LSR=True,
+        ST_PC=True,
+        use_LR=True,
+        use_RGM=True,
+        use_IB=True
 ):
     os.environ["CUDA_VISIBLE_DEVICES"] = device_id
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':16:8'
@@ -1499,6 +1471,12 @@ def run(
          # eta=[0.1,0.3,0.3,0.5,0.3,0.3, 0.01],
          eta=1,
          k_size=k_size,
+         branch_num=branch_num,
+         ST_LSR=ST_LSR,
+         ST_PC=ST_PC,
+         use_LR=use_LR,
+         use_RGM=use_RGM,
+         use_IB=use_IB,
          backbone=backbone,  # resnetv2,vgg,resnet,convnext,swintrans,shuffletrans,mpvit
          batch_size=2,
          learning_rate=0.0001,
@@ -1526,6 +1504,12 @@ if __name__ == '__main__':
     parser.add_argument('--log_name', type=str, default=None, help='日志名称')
     parser.add_argument('--backbone', type=str, default='resnetv2', help='骨干网络')
     parser.add_argument('--k_size', type=int, default=51, help='卷积核大小')
+    parser.add_argument('--wo_RGM', action='store_false',
+                        help="without RGM")
+    parser.add_argument('--wo_LR', action='store_false',
+                        help="without LR loss")
+    parser.add_argument('--wo_IB', action='store_false',
+                        help="without IRF branch")
 
     args = parser.parse_args()
     for seed in args.seedlist:
@@ -1537,4 +1521,8 @@ if __name__ == '__main__':
             root=args.root,
             log_name=args.log_name,
             backbone=args.backbone,
-            k_size=args.k_size)
+            k_size=args.k_size,
+            use_RGM=True if args.wo_RGM else False,
+            use_IB=True if args.wo_IB else False,
+            use_LR=True if args.wo_LR else False
+            )
