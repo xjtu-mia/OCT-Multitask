@@ -33,7 +33,7 @@ parser.add_argument('--split_cross_valid', action='store_true',
 '''
 training and testing
 '''
-parser.add_argument("--device_id", type=str, default='1',
+parser.add_argument("--device_id", type=str, default='0',
                     help="which GPU to use")
 parser.add_argument('--k', type=int, default=6,
                     help="k-fold validation")
